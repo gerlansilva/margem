@@ -61,7 +61,7 @@ jobs:
         run: cargo clippy --lib --tests --manifest-path src-tauri/Cargo.toml
 
   # Instaladores: macOS universal (Apple Silicon + Intel) e Windows (NSIS + MSI).
-  # Em tag v* o tauri-action também cria um release rascunho com os arquivos.
+  # Em push na main (ou execução manual) o tauri-action cria/atualiza o release v<versão> com os arquivos.
   bundle:
     needs: [frontend, rust]
     permissions:
@@ -101,9 +101,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: ${{ matrix.args }}
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('Margem {0}', github.ref_name) || '' }}
-          releaseDraft: true
+          tagName: ${{ github.event_name != 'pull_request' && 'v__VERSION__' || '' }}
+          releaseName: ${{ github.event_name != 'pull_request' && 'Margem v__VERSION__' || '' }}
+          releaseBody: "Instaladores para Windows (.exe e .msi) e macOS (.dmg, Apple Silicon e Intel). Os builds do Mac não são assinados: na primeira abertura, clique com o botão direito e escolha Abrir."
+          releaseDraft: false
           prerelease: false
       - uses: actions/upload-artifact@v4
         with:
