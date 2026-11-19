@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Doc {
     pub id: String,
+    /// Título exibido (editável por `rename_doc`). O arquivo em disco não muda.
     pub name: String,
+    /// Título original, definido na importação; o frontend o envia a `rename_doc`
+    /// para "restaurar nome original".
+    #[serde(default)]
+    pub original_title: String,
     pub page_count: i64,
     pub path: String,
     pub created_at: String,
@@ -62,6 +67,9 @@ pub struct Column {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Cell {
     pub doc_id: String,
+    /// Título atual do documento (vem do banco; ignorado ao gravar células).
+    #[serde(default)]
+    pub doc_title: String,
     pub column_id: String,
     pub value: Option<String>,
     pub quote: Option<String>,
@@ -128,6 +136,22 @@ pub struct Annotation {
     pub updated_at: String,
 }
 
+pub const MAX_TITLE_CHARS: usize = 200;
+
+/// Normaliza o título: controles viram espaço, espaços repetidos/pontas somem.
+/// Rejeita vazio e mais de 200 caracteres (contados após normalizar).
+pub fn normalize_title(raw: &str) -> Result<String, String> {
+    let cleaned: String = raw.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let title = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if title.is_empty() {
+        return Err("O título não pode ficar vazio.".into());
+    }
+    if title.chars().count() > MAX_TITLE_CHARS {
+        return Err(format!("O título é longo demais (máximo de {MAX_TITLE_CHARS} caracteres)."));
+    }
+    Ok(title)
+}
+
 const MAX_ANNOTATIONS: usize = 20_000;
 const MAX_ANNOTATION_TEXT: usize = 100_000;
 const ANNOTATION_COLORS: [&str; 5] = ["yellow", "green", "blue", "pink", "orange"];
@@ -169,6 +193,17 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[test]
+    fn normaliza_titulo() {
+        assert_eq!(normalize_title("  Batanero \t (1999)\n— Educação  ").unwrap(), "Batanero (1999) — Educação");
+        assert!(normalize_title("").is_err());
+        assert!(normalize_title(" \n\t ").is_err());
+        assert!(normalize_title(&"ã".repeat(200)).is_ok());
+        assert!(normalize_title(&"ã".repeat(201)).is_err());
+        // o limite vale depois de normalizar
+        assert!(normalize_title(&format!("  {}  ", "a ".repeat(100).trim())).is_ok());
     }
 
     #[test]

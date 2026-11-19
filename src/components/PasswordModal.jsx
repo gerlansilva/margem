@@ -19,7 +19,7 @@ export function PasswordModal({ name, wrong, onSubmit, onCancel }) {
         </header>
         <div className="form">
           <label>
-            Senha do documento
+            Senha
             <input
               data-autofocus
               type="password"
@@ -30,10 +30,9 @@ export function PasswordModal({ name, wrong, onSubmit, onCancel }) {
           </label>
           {wrong && (
             <p className="msg-error" role="alert">
-              Senha incorreta. Tente de novo.
+              Senha incorreta.
             </p>
           )}
-          <p className="form-note">A senha é usada só para ler o arquivo agora e não é gravada.</p>
         </div>
         <footer className="modal-foot">
           <button type="button" className="btn ghost" onClick={onCancel}>

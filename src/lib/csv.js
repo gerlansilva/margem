@@ -3,10 +3,15 @@
 
 const FORMULA = /^[=+\-@\t\r]/
 
+/** Prefixa com apóstrofo o texto que uma planilha leria como fórmula (números ficam como estão). */
+export function guardFormula(text) {
+  return FORMULA.test(text) && !/^[-+]?\d+([.,]\d+)?%?$/.test(text) ? `'${text}` : text
+}
+
 export function csvEscape(value, { guardFormulas = true, delimiter = ',' } = {}) {
   const needsQuotes = (t) => t.includes('"') || t.includes(delimiter) || /[\r\n]/.test(t) || /^\s|\s$/.test(t)
   let text = value == null ? '' : String(value)
-  if (guardFormulas && FORMULA.test(text) && !/^[-+]?\d+([.,]\d+)?%?$/.test(text)) text = `'${text}`
+  if (guardFormulas) text = guardFormula(text)
   return needsQuotes(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 

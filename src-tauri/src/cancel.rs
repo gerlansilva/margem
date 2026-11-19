@@ -1,13 +1,43 @@
 //! Registro de pedidos de chat cancelados. O cancelamento pode chegar antes de
 //! o chat registrar o pedido, ou depois de ele terminar, sem vazar memória.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const TTL: Duration = Duration::from_secs(15 * 60);
 const MAX_ENTRIES: usize = 512;
+
+/// Documentos com extração em andamento: impede duas extrações simultâneas do
+/// mesmo documento (uma sobrescreveria as células da outra). O Mutex só é
+/// segurado dentro das funções, nunca através de um `.await`.
+#[derive(Default, Clone)]
+pub struct BusyDocs {
+    inner: Arc<Mutex<HashSet<String>>>,
+}
+
+pub struct BusyGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
+}
+
+impl BusyDocs {
+    /// `None` se o documento já está ocupado. A trava some quando o guarda cai.
+    pub fn try_acquire(&self, id: &str) -> Option<BusyGuard> {
+        let mut set = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if !set.insert(id.to_string()) {
+            return None;
+        }
+        Some(BusyGuard { set: self.inner.clone(), id: id.to_string() })
+    }
+}
 
 #[derive(Default)]
 pub struct CancelRegistry {
@@ -76,6 +106,28 @@ mod tests {
         let r = CancelRegistry::new();
         r.cancel("b");
         assert!(r.token("b").load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn documento_ocupado_so_libera_ao_soltar_o_guarda() {
+        let busy = BusyDocs::default();
+        let g = busy.try_acquire("d1").expect("livre");
+        assert!(busy.try_acquire("d1").is_none());
+        assert!(busy.try_acquire("d2").is_some()); // outro documento não é afetado
+        drop(g);
+        assert!(busy.try_acquire("d1").is_some());
+    }
+
+    #[test]
+    fn guarda_libera_mesmo_com_pânico() {
+        let busy = BusyDocs::default();
+        let b2 = busy.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = b2.try_acquire("d1").unwrap();
+            panic!("falha no meio da extração");
+        })
+        .join();
+        assert!(busy.try_acquire("d1").is_some());
     }
 
     #[test]

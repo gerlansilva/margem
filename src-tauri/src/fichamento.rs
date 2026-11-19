@@ -4,10 +4,12 @@
 
 use std::collections::HashSet;
 
+use serde_json::{json, Value};
+
 use crate::ai::{self, RawCell};
 use crate::db::Db;
 use crate::evidence;
-use crate::model::{Column, Page};
+use crate::model::{Cell, Column, Page};
 
 pub fn apply_cells(
     db: &Db,
@@ -58,4 +60,16 @@ pub fn apply_cells(
         }
     }
     Ok(())
+}
+
+/// Eventos `ai` de progresso da extração, um por coluna pedida:
+/// `{id: requestId, type: "cell", docId, columnId, cell: Cell}`.
+/// Colunas sem célula gravada são omitidas.
+pub fn cell_events(request_id: &str, doc_id: &str, cols: &[Column], cells: &[Cell]) -> Vec<Value> {
+    cols.iter()
+        .filter_map(|c| {
+            let cell = cells.iter().find(|x| x.column_id == c.id)?;
+            Some(json!({"id": request_id, "type": "cell", "docId": doc_id, "columnId": c.id, "cell": cell}))
+        })
+        .collect()
 }

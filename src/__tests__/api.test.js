@@ -13,6 +13,7 @@ vi.mock('@tauri-apps/api/core', () => ({
     }
     if (cmd === 'write_text_file') return null
     if (cmd === 'write_csv') return args
+    if (cmd === 'extract' || cmd === 'cancel_chat') return args
     throw new Error(`comando inesperado ${cmd}`)
   }),
 }))
@@ -72,5 +73,13 @@ describe('api no navegador (sem backend)', () => {
     await api.saveAnnotations('d9', [legacy('z', 'd9')])
     expect(await kvGet('ann:d9')).toHaveLength(1)
     expect(await api.getAnnotations('d9')).toHaveLength(1)
+  })
+})
+
+describe('api.extract', () => {
+  it('envia requestId (camelCase) e columnIds; sem eles manda null', async () => {
+    expect(await api.extract('d1', ['c1'], 'ext-1')).toEqual({ docId: 'd1', columnIds: ['c1'], requestId: 'ext-1' })
+    expect(await api.extract('d1')).toEqual({ docId: 'd1', columnIds: null, requestId: null })
+    expect(await api.cancelChat('ext-1')).toEqual({ requestId: 'ext-1' })
   })
 })

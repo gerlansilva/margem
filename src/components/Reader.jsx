@@ -5,7 +5,7 @@ import { convertFileSrc } from '../api'
 import { COLORS } from '../lib/annotations'
 import { makeAnchor, resolveAnchor, searchRanges } from '../lib/anchors'
 import { searchPages } from '../lib/search'
-import { hasMod, shortcut } from '../lib/platform'
+import { hasMod } from '../lib/platform'
 
 /** Caixas que estão inteiramente dentro de outra saem (getClientRects repete). */
 function dedupe(boxes) {
@@ -193,7 +193,7 @@ const PageView = memo(function PageView({
       <div ref={bodyRef} className="page-body">
         {empty ? (
           <p className="page-empty">
-            Esta página não tem texto selecionável (pode ser uma imagem). Use “Ver esta página no PDF”.
+            Sem texto selecionável.
           </p>
         ) : (
           <Markdown>{page.md}</Markdown>
@@ -448,12 +448,8 @@ export function Reader({
     return (
       <div className="empty">
         <div className="empty-art">{Icon.book({ className: 'ico big' })}</div>
-        <h2>Abra um PDF para começar</h2>
-        <p>
-          O texto é convertido em uma página de leitura com âncoras por página. Selecione um trecho para
-          perguntar ou destacar, ou use o painel ao lado. Você também pode arrastar um PDF para esta janela.
-        </p>
-        <p className="muted tip">Dica: {shortcut('O')} adiciona um PDF · {shortcut('F')} busca no texto.</p>
+        <h2>Nenhum PDF aberto</h2>
+        <p className="muted">Adicione ou arraste um arquivo aqui.</p>
       </div>
     )
   }
@@ -463,7 +459,7 @@ export function Reader({
       <div className="empty">
         <div className="empty-art">{Icon.doc({ className: 'ico big' })}</div>
         <h2>{doc.name}</h2>
-        <p>Este PDF ainda não foi convertido para leitura (a importação pode ter sido interrompida).</p>
+        <p className="muted">PDF não convertido.</p>
         <button className="btn primary" style={{ marginTop: 16 }} onClick={onReprocess}>
           Converter agora
         </button>
@@ -482,7 +478,7 @@ export function Reader({
             ref={searchInput}
             type="search"
             aria-label="Buscar no documento"
-            placeholder="Buscar no documento…"
+            placeholder="Buscar"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
@@ -529,7 +525,7 @@ export function Reader({
       >
         <div className="doc-head">
           <h1>{doc.name}</h1>
-          <span className="pill">{doc.page_count} páginas</span>
+          <span className="pill">{doc.page_count} {doc.page_count === 1 ? 'página' : 'páginas'}</span>
           <button className="btn tiny" onClick={onReprocess} title="Converter o texto novamente">
             Reprocessar
           </button>
@@ -673,7 +669,7 @@ function AnnotationPopover({ ann, x, y, focusNote, onChange, onDelete, onAsk, on
       <textarea
         ref={area}
         rows={3}
-        placeholder="Escreva uma nota…"
+        placeholder="Nota"
         aria-label="Nota do destaque"
         value={note}
         onChange={(event) => {

@@ -6,7 +6,7 @@ Leitor de PDF acadêmico com chat que cita página e trecho, e quadro de fichame
 
 A pergunta nasce na margem: você lê o artigo, anota uma dúvida ao lado do parágrafo e a resposta volta apontando de onde saiu. Clicar em `p. 7` abre o PDF na página e destaca exatamente as linhas citadas.
 
-![Citação resolvida em duas linhas, destacadas em damasco](docs/citacao.png)
+![Citação resolvida em duas linhas, destacadas em âmbar](docs/citacao.png)
 
 ## O que faz
 
@@ -96,18 +96,18 @@ Para apagar tudo, feche o app e remova essa pasta (e a chave, em Configurações
 
 ## Identidade
 
-Nome de trabalho: **Margem** — a pergunta anotada ao lado do parágrafo. O "m" manuscrito fecha numa interrogação e o ponto em damasco é a anotação à margem.
+Nome de trabalho: **Margem** — a pergunta anotada ao lado do parágrafo. O "m" manuscrito fecha numa interrogação e o ponto âmbar é a anotação à margem.
 
 | Cor | HEX | Onde |
 | --- | --- | --- |
-| Ameixa | `#512E49` | marca, aba ativa, botões (texto branco) |
-| Marfim | `#FAF6EF` | fundo ao redor do documento |
+| Índigo | `#3346C0` | marca (fundo do logo), aba ativa, botões (texto branco), traço lateral do trecho citado |
+| Papel | `#F3F6FB` | fundo ao redor do documento |
 | Branco | `#FFFFFF` | página do artigo, painel do assistente, células |
-| Grafite | `#302A2E` | texto do artigo, perguntas e respostas |
-| Damasco | `#F2AD83` | ponto do logo, traço lateral do trecho citado |
-| Damasco claro | `#FBE5D6` | fundo do destaque e etiquetas `p. 1` / `p. 7` |
+| Tinta | `#181E2C` | texto do artigo, perguntas e respostas |
+| Âmbar | `#BD871C` | destaque da evidência no PDF (o ponto do logo é `#EDB333`) |
+| Âmbar claro | `#FFF2CF` | fundo do destaque e etiquetas `p. 1` / `p. 7` |
 
-Tudo sai de `src/styles.css` (`:root`): `--accent`, `--canvas`, `--ink`, `--evidence`, `--evidence-soft`. O site deve usar os mesmos valores — ameixa nas ações, damasco nas evidências — para que a etiqueta `p. 7` do fichamento e o traço no PDF sejam reconhecidos como a mesma marca.
+A paleta é única e clara (o app não tem tema escuro; o PDF também fica sempre claro). Tudo sai de `src/styles.css` (`:root`): `--accent`, `--canvas`, `--ink`, `--evidence`, `--evidence-soft`. O site deve usar os mesmos valores — índigo nas ações, âmbar nas evidências — para que a etiqueta `p. 7` do fichamento e o traço no PDF sejam reconhecidos como a mesma marca.
 
 O identificador do aplicativo continua `br.com.gerlan.pdfchat`: mudá-lo mudaria a pasta de dados e a biblioteca existente ficaria para trás.
 
@@ -128,7 +128,7 @@ Tabelas e referências não entram nesse corte: a nota só é removida quando co
 Cada página guarda duas coisas além do Markdown: os blocos (para o leitor) e as **linhas** com o texto e o retângulo no espaço do PDF (`[x0, y0, x1, y1]`, origem embaixo à esquerda). O retângulo é o que sobrevive a zoom, rotação e redimensionamento: o destaque é recalculado a cada renderização com a matriz do viewport, nunca com pixels fixos.
 
 - `resolve_evidence(doc, página, citação)` acha a menor sequência contígua de linhas que contém a citação. Se o texto exato não casa — a IA às vezes troca uma flexão, "coligiu" por "coligidas" —, cai num alinhamento por palavras que exige 70% delas na ordem e um vão curto de linhas. Citação inventada continua sem destaque.
-- O id (`doc:página:primeira-última`) é gravado na tabela `evidence`. O fichamento guarda os ids em `cells.evidence`; ao clicar na célula, o modal abre o PDF na página, desenha o destaque em damasco e centraliza o trecho. Sem id, o modal resolve a citação na hora; se não achar, avisa "trecho não localizado" e não destaca nada.
+- O id (`doc:página:primeira-última`) é gravado na tabela `evidence`. O fichamento guarda os ids em `cells.evidence`; ao clicar na célula, o modal abre o PDF na página, desenha o destaque em âmbar e centraliza o trecho. Sem id, o modal resolve a citação na hora; se não achar, avisa "trecho não localizado" e não destaca nada.
 - Página de duas colunas é lida por faixas: o que atravessa a página fecha a faixa, e dentro dela a coluna esquerda vem antes da direita. Sem isso, uma frase que muda de coluna era montada com pedaços de linhas diferentes.
 
 ## Estrutura
@@ -146,7 +146,7 @@ src-tauri/src/
   files.rs           caminhos seguros e gravação de .md/.txt/.csv
   secrets.rs         chave da API no cofre do sistema (keystore.rs)
   model.rs           tipos compartilhados
-src-tauri/icons/     ícone do app (gerado a partir de docs/logo.png)
+src-tauri/icons/     ícone do app (gerado com `npx tauri icon` a partir de um PNG 1024 do logo)
 ```
 
 ## Testes

@@ -2,10 +2,10 @@ import fs from 'node:fs'
 import { launch, open, importPdf, shot, report } from './lib.mjs'
 const results = []
 const ok = (name, cond, extra = '') => { results.push([name, !!cond]); console.log(`${cond ? 'OK   ' : 'FALHA'} ${name} ${extra}`) }
-const { browser, context, page, errors } = await launch({ dark: true })
+const { browser, context, page, errors } = await launch()
 try {
   await open(page)
-  ok('tema escuro aplicado (auto)', (await page.evaluate(() => document.documentElement.dataset.theme)) === 'dark')
+  ok('sem tema escuro: color-scheme claro e sem data-theme', (await page.evaluate(() => getComputedStyle(document.documentElement).colorScheme === 'light' && !document.documentElement.dataset.theme)))
   // escaneado
   await importPdf(page, 'so-imagem', { wait: false })
   await page.waitForSelector('.toast', { timeout: 30000 })
@@ -45,12 +45,18 @@ try {
     return performance.now() - t
   })
   ok('scroll em 200p fluido', dt < 4000, `${Math.round(dt)} ms p/ 30 saltos`)
-  await shot(page, '11-200p-escuro')
+  await shot(page, '11-200p')
   // exportação de notas (md) via download
   await importPdf(page, 'artigo-2colunas')
-  await page.waitForTimeout(500)
-  await page.keyboard.press('Control+2'); await page.waitForTimeout(400)
-  await shot(page, '12-fichamento-escuro')
+  // A importação só termina quando o doc entra na biblioteca e a barra de progresso some;
+  // antes disso a conclusão volta para a leitura e desfaz a troca para o Fichamento.
+  await page.waitForFunction(() => document.querySelectorAll('.doc-item').length >= 2 && !document.querySelector('.busybar'), undefined, { timeout: 30000 })
+  await page.waitForTimeout(300)
+  await page.keyboard.press('Control+2')
+  // O Fichamento é carregado sob demanda: espera a tabela aparecer antes da captura.
+  await page.waitForSelector('table.fichamento th.sticky', { state: 'visible', timeout: 10000 })
+  await page.waitForTimeout(300)
+  await shot(page, '12-fichamento')
   const cols = await page.locator('table.fichamento th').count()
   console.log('   colunas th:', cols)
   // responsivo

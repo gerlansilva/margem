@@ -6,14 +6,14 @@ export const URL = process.env.MARGEM_URL || 'http://localhost:1420/'
 export const SHOTS = process.env.MARGEM_SHOTS || '/tmp/shots'
 fs.mkdirSync(SHOTS, { recursive: true })
 
-export async function launch({ width = 1440, height = 900, dark = false, mac = false } = {}) {
+export async function launch({ width = 1440, height = 900, mac = false } = {}) {
   const browser = await chromium.launch({
     executablePath: process.env.CHROME || '/usr/bin/google-chrome',
     args: ['--no-sandbox', '--disable-gpu'],
   })
   const context = await browser.newContext({
     viewport: { width, height },
-    colorScheme: dark ? 'dark' : 'light',
+    colorScheme: 'light',
     permissions: ['clipboard-read', 'clipboard-write'],
     acceptDownloads: true,
     userAgent: mac

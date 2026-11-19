@@ -1,16 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { confirm as confirmDialog } from '@tauri-apps/plugin-dialog'
 import { api, errorText, listen } from '../api'
-import { shortcut } from '../lib/platform'
 import { Icon } from './Icons'
 import { stripTruncatedNotice } from '../lib/citations'
 import { Markdown } from './Markdown'
 
 const SUGGESTIONS = [
-  'Resuma as contribuições principais do artigo.',
-  'Qual é a metodologia e qual o tamanho da amostra?',
-  'Quais são as limitações declaradas pelos autores?',
-  'Que resultados numéricos o artigo reporta?',
+  'Resuma as contribuições principais.',
+  'Qual a metodologia e o tamanho da amostra?',
+  'Quais as limitações declaradas?',
+  'Que resultados numéricos são reportados?',
+]
+const SUGGESTIONS_MANY = [
+  'Compare os objetivos e métodos.',
+  'Onde os resultados convergem e divergem?',
+  'Compare as amostras e as limitações.',
 ]
 
 const MAX_HISTORY = 12
@@ -43,7 +47,9 @@ async function copyText(text) {
 export function ChatPanel({
   docs,
   scopeIds,
-  setScopeIds,
+  hasSelection,
+  onDeselect,
+  onClearSelection,
   hasKey,
   onOpenSettings,
   onSource,
@@ -59,6 +65,7 @@ export function ChatPanel({
   const [active, setActive] = useState(null)
   const [selection, setSelection] = useState(null)
   const [loaded, setLoaded] = useState(false)
+  const [copiedId, setCopiedId] = useState(null)
   const endRef = useRef(null)
   const listRef = useRef(null)
   const inputRef = useRef(null)
@@ -277,15 +284,32 @@ export function ChatPanel({
     onSource({ doc, page, quote: quote || '' })
   }
 
-  const others = docs.filter((d) => !scopeIds.includes(d.id) && d.page_count > 0)
   const busy = !!active
 
   return (
     <aside className="chat" hidden={hidden} aria-label="Assistente">
       <div className="chat-head">
-        <div>
-          <h3>Assistente</h3>
-          <p>{scopeDocs.length === 1 ? scopeDocs[0].name : `${scopeDocs.length} documentos no escopo`}</p>
+        <div className="scope" aria-label="Documentos da conversa">
+          {scopeDocs.map((doc, index) => (
+            <span className="scope-chip" key={doc.id} title={doc.name}>
+              <b>D{index + 1}</b> <span className="scope-name">{doc.name}</span>
+              {hasSelection && (
+                <button
+                  className="chip-x"
+                  title="Remover da conversa"
+                  aria-label={`Remover ${doc.name} da conversa`}
+                  onClick={() => onDeselect(doc.id)}
+                >
+                  {Icon.close({ className: 'ico' })}
+                </button>
+              )}
+            </span>
+          ))}
+          {hasSelection && (
+            <button className="link-btn scope-reset" onClick={onClearSelection} title="Voltar ao documento aberto">
+              Só o aberto
+            </button>
+          )}
         </div>
         <div className="chat-head-actions">
           <button
@@ -306,52 +330,14 @@ export function ChatPanel({
           >
             {Icon.trash({ className: 'ico' })}
           </button>
-          <button className="icon-btn" title={`Configurações (${shortcut(',')})`} aria-label="Configurações" onClick={onOpenSettings}>
-            {Icon.gear({ className: 'ico' })}
-          </button>
         </div>
-      </div>
-
-      <div className="scope">
-        {scopeDocs.map((doc, index) => (
-          <span className="scope-chip" key={doc.id}>
-            <b>D{index + 1}</b> {doc.name.length > 28 ? `${doc.name.slice(0, 28)}…` : doc.name}
-            {scopeIds.length > 1 && (
-              <button
-                className="chip-x"
-                title="Remover do escopo"
-                aria-label={`Remover ${doc.name} do escopo`}
-                onClick={() => setScopeIds(scopeIds.filter((id) => id !== doc.id))}
-              >
-                {Icon.close({ className: 'ico' })}
-              </button>
-            )}
-          </span>
-        ))}
-        {others.length > 0 && (
-          <select
-            className="scope-add"
-            aria-label="Comparar com outro documento"
-            value=""
-            onChange={(event) => {
-              if (event.target.value) setScopeIds([...scopeIds, event.target.value])
-            }}
-          >
-            <option value="">+ comparar com…</option>
-            {others.map((doc) => (
-              <option key={doc.id} value={doc.id}>
-                {doc.name}
-              </option>
-            ))}
-          </select>
-        )}
       </div>
 
       {!hasKey && (
         <div className="banner" role="status">
-          Configure a chave da DeepSeek para conversar com o PDF.
+          Falta a chave da API.
           <button className="link" onClick={onOpenSettings}>
-            Abrir configurações
+            Configurar
           </button>
         </div>
       )}
@@ -367,20 +353,12 @@ export function ChatPanel({
         }}
       >
         {messages.length === 0 && (
-          <div className="chat-empty">
-            <span className="chat-empty-mark">{Icon.comment({ className: 'ico' })}</span>
-            <h4>Pergunte a este artigo</h4>
-            <p>
-              Cada resposta cita a página e o trecho de onde saiu. Selecione um trecho na leitura para
-              perguntar sobre ele.
-            </p>
-            <div className="starters">
-              {SUGGESTIONS.map((item) => (
-                <button key={item} className="starter" onClick={() => send(item)} disabled={!hasKey || busy}>
-                  {item}
-                </button>
-              ))}
-            </div>
+          <div className="starters">
+            {(scopeDocs.length > 1 ? SUGGESTIONS_MANY : SUGGESTIONS).map((item) => (
+              <button key={item} className="starter" onClick={() => send(item)} disabled={!hasKey || busy}>
+                {item}
+              </button>
+            ))}
           </div>
         )}
 
@@ -411,12 +389,12 @@ export function ChatPanel({
                 {message.pending && <span className="typing" role="status" aria-label="Escrevendo" />}
                 {message.truncated && (
                   <p className="msg-warn" role="note" data-testid="truncated-note">
-                    Resposta cortada pelo limite de tamanho do modelo. Peça para continuar ou faça uma pergunta mais específica.
+                    Resposta cortada pelo limite do modelo.
                   </p>
                 )}
                 {message.citations?.some((c) => c.valid === false) && (
                   <p className="msg-warn" role="note" data-testid="invalid-cite-note">
-                    Há citações não verificadas (páginas que o modelo não recebeu): estão tracejadas. Confira no PDF.
+                    Citações tracejadas não foram verificadas.
                   </p>
                 )}
                 {message.stopped && <p className="msg-note">Resposta interrompida.</p>}
@@ -434,11 +412,13 @@ export function ChatPanel({
                       className="icon-btn subtle"
                       title="Copiar resposta"
                       aria-label="Copiar resposta"
-                      onClick={async () =>
-                        onNotify?.((await copyText(message.content)) ? 'Resposta copiada.' : 'Não foi possível copiar.')
-                      }
+                      onClick={async () => {
+                        if (!(await copyText(message.content))) return onNotify?.('Não foi possível copiar.', 'error')
+                        setCopiedId(message.id)
+                        setTimeout(() => setCopiedId((id) => (id === message.id ? null : id)), 1500)
+                      }}
                     >
-                      {Icon.copy({ className: 'ico' })}
+                      {copiedId === message.id ? Icon.check({ className: 'ico' }) : Icon.copy({ className: 'ico' })}
                     </button>
                   </div>
                 )}
@@ -474,7 +454,7 @@ export function ChatPanel({
           <textarea
             ref={inputRef}
             rows={1}
-            placeholder="Pergunte algo sobre o documento…"
+            placeholder="Pergunte"
             aria-label="Pergunta"
             value={input}
             onChange={(event) => setInput(event.target.value)}
@@ -503,16 +483,6 @@ export function ChatPanel({
               aria-label="Enviar pergunta"
             >
               {Icon.send({ className: 'ico' })}
-            </button>
-          )}
-        </div>
-        <div className="composer-actions">
-          <span className="hint">
-            Enter envia · Shift+Enter quebra linha · {shortcut('K')} foca aqui
-          </span>
-          {busy && (
-            <button className="btn tiny" onClick={stop}>
-              {Icon.stop({ className: 'ico' })} Parar
             </button>
           )}
         </div>

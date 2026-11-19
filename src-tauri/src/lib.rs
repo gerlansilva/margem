@@ -22,7 +22,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use ai::DocContext;
-use cancel::CancelRegistry;
+use cancel::{BusyDocs, CancelRegistry};
 use db::Db;
 use model::{Cell, ChatRequest, Column, Doc, Evidence, Page};
 use net::NetErrorKind;
@@ -36,12 +36,18 @@ const KEY_SETTING: &str = "api_key";
 const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Extração não usa stream: o corpo só chega quando o modelo termina.
 const EXTRACT_TIMEOUT: Duration = Duration::from_secs(360);
+/// Extrações simultâneas (documentos diferentes); as demais esperam na fila.
+const MAX_CONCURRENT_EXTRACTS: usize = 3;
 const MAX_FIGURE_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct AppState {
     db: Db,
     http: reqwest::Client,
     cancel: CancelRegistry,
+    /// Documentos em extração (um por vez cada).
+    busy_docs: BusyDocs,
+    /// No máximo `MAX_CONCURRENT_EXTRACTS` chamadas ao modelo ao mesmo tempo.
+    extract_slots: std::sync::Arc<tokio::sync::Semaphore>,
     vault: Box<dyn SecretStore>,
 }
 
@@ -143,6 +149,13 @@ fn import_doc(app: AppHandle, state: State<'_, AppState>, path: String) -> Resul
 #[tauri::command]
 fn list_docs(state: State<'_, AppState>) -> Result<Vec<Doc>, String> {
     state.db.list_docs()
+}
+
+/// Renomeia só o título exibido. Devolve o Doc no formato de `list_docs`;
+/// `original_title` permite restaurar (o frontend reenvia esse valor).
+#[tauri::command]
+fn rename_doc(state: State<'_, AppState>, doc_id: String, title: String) -> Result<Doc, String> {
+    state.db.rename_doc(&doc_id, &title)
 }
 
 #[tauri::command]
@@ -452,14 +465,49 @@ fn update_cell(
     )
 }
 
+/// Extrai células do fichamento de UM documento. Seguro para vários documentos
+/// em sequência ou em paralelo (o frontend pode chamar 2–3 ao mesmo tempo):
+/// - nenhum Mutex do banco é segurado durante rede/`.await`;
+/// - no máximo `MAX_CONCURRENT_EXTRACTS` chamadas ao modelo; as outras esperam;
+/// - o mesmo documento não extrai duas vezes ao mesmo tempo (erro em pt-BR);
+/// - só as colunas pedidas (`column_ids`; todas se `None`) são gravadas: células
+///   de outras colunas nunca são tocadas.
+///
+/// `request_id` (opcional, um por documento) habilita `cancel_chat(request_id)`
+/// e eventos no canal `ai`: `{id, type:"status", docId, message}` (nova tentativa)
+/// e, após gravar, `{id, type:"cell", docId, columnId, cell}` por coluna pedida.
+/// A resposta do modelo vem inteira, então os eventos `cell` saem juntos ao final.
+/// Cancelado: nada é gravado e o comando falha com "Operação cancelada.".
 #[tauri::command]
 async fn extract(
+    app: AppHandle,
     state: State<'_, AppState>,
     doc_id: String,
     column_ids: Option<Vec<String>>,
+    request_id: Option<String>,
 ) -> Result<Vec<Cell>, String> {
-    let doc = state.db.get_doc(&doc_id)?.ok_or("Documento não encontrado.")?;
-    let pages = state.db.pages(&doc_id)?;
+    let rid = request_id.filter(|r| !r.trim().is_empty());
+    let cancel = rid.as_ref().map(|r| state.cancel.token(r));
+    let result = run_extract(&app, &state, &doc_id, column_ids, rid.as_deref(), cancel.as_deref()).await;
+    if let Some(r) = &rid {
+        state.cancel.release(r);
+    }
+    result
+}
+
+const CANCELLED_MSG: &str = "Operação cancelada.";
+
+async fn run_extract(
+    app: &AppHandle,
+    state: &AppState,
+    doc_id: &str,
+    column_ids: Option<Vec<String>>,
+    rid: Option<&str>,
+    cancel: Option<&AtomicBool>,
+) -> Result<Vec<Cell>, String> {
+    let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::SeqCst));
+    let doc = state.db.get_doc(doc_id)?.ok_or("Documento não encontrado.")?;
+    let pages = state.db.pages(doc_id)?;
     if pages.is_empty() {
         return Err("O texto deste PDF ainda não foi extraído.".into());
     }
@@ -471,6 +519,18 @@ async fn extract(
         return Err("Defina ao menos uma coluna.".into());
     }
     let cfg = state.ai_config()?;
+    let _busy = state
+        .busy_docs
+        .try_acquire(doc_id)
+        .ok_or("Este documento já está sendo extraído. Aguarde terminar.")?;
+    // Fila: espera uma vaga, mas sai na hora se cancelarem.
+    let _slot = tokio::select! {
+        p = state.extract_slots.clone().acquire_owned() => p.map_err(|e| e.to_string())?,
+        _ = wait_cancelled(cancel) => return Err(CANCELLED_MSG.into()),
+    };
+    if is_cancelled() {
+        return Err(CANCELLED_MSG.into());
+    }
     let ctx = [DocContext {
         label: "D1".to_string(),
         doc: &doc,
@@ -490,13 +550,20 @@ async fn extract(
     let mut raw_cells = None;
     let mut last_error = String::new();
     for _ in 0..2 {
-        let resp = post_with_retry(&state.http, &out, None, |_| {})
-            .await
-            .map_err(|e| match e {
-                SendError::Failed(m) => m,
-                SendError::Cancelled => "Operação cancelada.".to_string(),
-            })?;
-        let payload: Value = resp.json().await.map_err(net_message)?;
+        let resp = post_with_retry(&state.http, &out, cancel, |message| {
+            if let Some(id) = rid {
+                emit_ai(app, json!({"id": id, "type": "status", "docId": doc_id, "message": message}));
+            }
+        })
+        .await
+        .map_err(|e| match e {
+            SendError::Failed(m) => m,
+            SendError::Cancelled => CANCELLED_MSG.to_string(),
+        })?;
+        let payload: Value = tokio::select! {
+            r = resp.json::<Value>() => r.map_err(net_message)?,
+            _ = wait_cancelled(cancel) => return Err(CANCELLED_MSG.into()),
+        };
         if let Some(msg) = payload["error"]["message"].as_str() {
             return Err(format!("A DeepSeek devolveu um erro: {msg}"));
         }
@@ -516,8 +583,23 @@ async fn extract(
         }
     }
     let raw_cells = raw_cells.ok_or(last_error)?;
-    fichamento::apply_cells(&state.db, &doc_id, &pages, &cols, raw_cells)?;
-    state.db.cells(Some(&doc_id))
+    if is_cancelled() {
+        return Err(CANCELLED_MSG.into());
+    }
+    // Colunas apagadas durante a espera não ganham células órfãs.
+    let current = state.db.columns()?;
+    cols.retain(|c| current.iter().any(|x| x.id == c.id));
+    if state.db.get_doc(doc_id)?.is_none() {
+        return Err("O documento foi removido durante a extração.".into());
+    }
+    fichamento::apply_cells(&state.db, doc_id, &pages, &cols, raw_cells)?;
+    let cells = state.db.cells(Some(doc_id))?;
+    if let Some(id) = rid {
+        for event in fichamento::cell_events(id, doc_id, &cols, &cells) {
+            emit_ai(app, event);
+        }
+    }
+    Ok(cells)
 }
 
 #[tauri::command]
@@ -807,6 +889,8 @@ pub fn run() {
                 db,
                 http,
                 cancel: CancelRegistry::new(),
+                busy_docs: BusyDocs::default(),
+                extract_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXTRACTS)),
                 vault,
             });
             Ok(())
@@ -814,6 +898,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             import_doc,
             list_docs,
+            rename_doc,
             get_doc,
             delete_doc,
             save_pages,

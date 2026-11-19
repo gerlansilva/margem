@@ -52,7 +52,7 @@ try {
 
   // chat
   await page.getByRole('tab', { name: /Assistente/ }).click()
-  await page.getByPlaceholder(/Pergunte algo/).fill('Qual a amostra?')
+  await page.getByPlaceholder(/Pergunte/).fill('Qual a amostra?')
   await page.keyboard.press('Enter')
   await page.waitForSelector('.msg.assistant')
   await page.waitForTimeout(2500)
@@ -72,7 +72,7 @@ try {
   await page.keyboard.press('Control+2')
   await page.waitForTimeout(500)
   await shot(page, '08-fichamento')
-  // configurações / tema escuro
+  // configurações
   await page.keyboard.press('Control+,')
   await page.waitForTimeout(400)
   await shot(page, '09-config')

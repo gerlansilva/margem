@@ -14,6 +14,7 @@ const state = {
   cells: [],
   settings: { has_key: true, key_source: 'keychain', secure_storage: true, model: 'deepseek-flash', base_url: 'https://api.deepseek.com' },
   cancelled: new Set(),
+  extracting: new Set(), // docIds em extração
   annotations: {}, // docId -> Annotation[]
   seq: 1,
 }
@@ -26,10 +27,13 @@ const control = {
   chatDelayMs: 12,
   chatFail: null,
   chatRetry: false, // emite evento `status` (nova tentativa) antes de responder
+  extractDelayMs: 250, // duração de cada extract
+  extractRetry: false, // emite `status` (nova tentativa) por documento
   chatTruncate: false, // finaliza com truncated: true
   chatInvalidCite: false, // acrescenta citação de página que não existe
   files: {}, // arquivos "gravados"
   calls: [],
+  docIds: () => state.docs.map((d) => d.id),
   lastChat: null,
 }
 window.__MOCK__ = control
@@ -67,7 +71,21 @@ function pageCount(docId) {
 }
 
 function listDocs() {
-  return state.docs.map((doc) => ({ ...doc, page_count: pageCount(doc.id) }))
+  return state.docs.map((doc) => ({ ...doc, original_title: doc.original_title ?? doc.name, page_count: pageCount(doc.id) }))
+}
+
+/** Células com o título atual do documento (como get_cells no backend). */
+function cellsWithTitle(docId) {
+  const title = (id) => state.docs.find((d) => d.id === id)?.name || ''
+  return state.cells.filter((c) => !docId || c.doc_id === docId).map((c) => ({ ...c, doc_title: title(c.doc_id) }))
+}
+
+/** Mesma regra de model::normalize_title. */
+function normalizeTitle(raw) {
+  const title = String(raw ?? '').replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').split(/\s+/).filter(Boolean).join(' ')
+  if (!title) throw 'O título não pode ficar vazio.'
+  if ([...title].length > 200) throw 'O título é longo demais (máximo de 200 caracteres).'
+  return title
 }
 
 /** Porte simplificado de evidence::resolve: sequência contígua de linhas. */
@@ -191,7 +209,7 @@ function mockExtract(docId, columnIds) {
     }
   })
   state.cells = [...state.cells.filter((c) => !(c.doc_id === docId && out.some((o) => o.column_id === c.column_id))), ...out]
-  return state.cells.filter((c) => c.doc_id === docId)
+  return cellsWithTitle(docId)
 }
 
 function csvEscape(v, d = ',') {
@@ -226,6 +244,7 @@ async function handle(cmd, payload = {}) {
       const doc = {
         id: `doc${state.seq++}`,
         name,
+        original_title: name,
         path: path.startsWith('/') ? path : `/__fixtures__/${name}.pdf`,
         page_count: 0,
         created_at: new Date().toISOString(),
@@ -235,6 +254,14 @@ async function handle(cmd, payload = {}) {
     }
     case 'list_docs':
       return listDocs()
+    case 'rename_doc': {
+      const doc = state.docs.find((d) => d.id === payload.docId)
+      const title = normalizeTitle(payload.title)
+      if (!doc) throw 'Documento não encontrado.'
+      doc.original_title = doc.original_title ?? doc.name
+      doc.name = title
+      return listDocs().find((d) => d.id === doc.id)
+    }
     case 'get_doc': {
       const doc = listDocs().find((d) => d.id === payload.docId)
       if (!doc) throw 'Documento não encontrado.'
@@ -286,12 +313,41 @@ async function handle(cmd, payload = {}) {
       return state.columns
     }
     case 'get_cells':
-      return payload.docId ? state.cells.filter((c) => c.doc_id === payload.docId) : state.cells
+      return cellsWithTitle(payload.docId)
     case 'update_cell':
       return null
-    case 'extract':
-      await sleep(250)
-      return mockExtract(payload.docId, payload.columnIds)
+    case 'extract': {
+      // Como o backend: um por documento, cancelável por requestId, evento `cell` por coluna.
+      const { docId, columnIds, requestId } = payload
+      if (!state.docs.some((d) => d.id === docId)) throw 'Documento não encontrado.'
+      if (state.extracting.has(docId)) throw 'Este documento já está sendo extraído. Aguarde terminar.'
+      state.extracting.add(docId)
+      const cancelled = () => !!requestId && state.cancelled.has(requestId)
+      try {
+        if (control.extractRetry) {
+          await emit('ai', { id: requestId, type: 'status', docId, message: 'Servidor ocupado. Nova tentativa em 2 s…' })
+        }
+        // Dorme em fatias para cancelar na hora (o backend também cancela na fila e no download).
+        const until = Date.now() + (control.extractDelayMs ?? 250) + (control.extractRetry ? 600 : 0)
+        while (Date.now() < until) {
+          if (cancelled()) throw 'Operação cancelada.'
+          await sleep(20)
+        }
+        if (cancelled()) throw 'Operação cancelada.'
+        const cells = mockExtract(docId, columnIds)
+        if (requestId) {
+          const wanted = state.columns.filter((c) => !columnIds || columnIds.includes(c.id))
+          for (const col of wanted) {
+            const cell = cells.find((c) => c.column_id === col.id)
+            if (cell) await emit('ai', { id: requestId, type: 'cell', docId, columnId: col.id, cell })
+          }
+        }
+        return cells
+      } finally {
+        state.extracting.delete(docId)
+        if (requestId) state.cancelled.delete(requestId)
+      }
+    }
     case 'write_csv': {
       checkExportPath(payload.path)
       const d = payload.delimiter || ','

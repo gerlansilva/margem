@@ -1,6 +1,6 @@
 import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { confirm as confirmDialog, open, save } from '@tauri-apps/plugin-dialog'
-import { api, convertFileSrc, downloadText, errorText, inTauri } from './api'
+import { api, convertFileSrc, downloadText, errorText, inTauri, listen } from './api'
 import { extractPages, forgetPdf, friendlyPdfError, loadPdf, pdfHooks, textLength } from './pdf'
 import { Sidebar } from './components/Sidebar'
 import { Reader } from './components/Reader'
@@ -9,10 +9,10 @@ import { NotesPanel } from './components/NotesPanel'
 import { Icon } from './components/Icons'
 import { PasswordModal } from './components/PasswordModal'
 import { buildFichamentoCsv } from './lib/csv'
+import { mergeCells, planExtraction, pruneSelection, runExtractionJob } from './lib/fichamento'
 import { conversationToMarkdown, notesToMarkdown, safeFileName } from './lib/exporters'
 import { createAnnotation, normalizeAnnotations } from './lib/annotations'
 import { hasMod, isTyping, shortcut } from './lib/platform'
-import { pref, setPref } from './store'
 
 // Peças pesadas ou raras saem do primeiro carregamento.
 const Fichamento = lazy(() => import('./components/Fichamento').then((m) => ({ default: m.Fichamento })))
@@ -27,12 +27,6 @@ class NoTextError extends Error {
   }
 }
 
-function applyTheme(theme) {
-  const dark =
-    theme === 'dark' || (theme === 'auto' && window.matchMedia?.('(prefers-color-scheme: dark)').matches)
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light'
-}
-
 export default function App() {
   const [docs, setDocs] = useState([])
   const [currentId, setCurrentId] = useState(null)
@@ -43,14 +37,14 @@ export default function App() {
   const [settings, setSettings] = useState(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [shortcutsOpen, setShortcutsOpen] = useState(false)
-  const [scopeIds, setScopeIds] = useState([])
+  const [selectedIds, setSelectedIds] = useState([])
+  const [job, setJob] = useState(null)
   const [source, setSource] = useState(null)
   const [seed, setSeed] = useState(null)
   const [busy, setBusy] = useState(null)
   const [toast, setToast] = useState(null)
   const [annotations, setAnnotations] = useState([])
   const [sideTab, setSideTab] = useState('chat')
-  const [theme, setTheme] = useState(() => pref('theme', 'auto'))
   const [passwordReq, setPasswordReq] = useState(null)
   const [dragging, setDragging] = useState(false)
   const [focusNonce, setFocusNonce] = useState(0)
@@ -60,6 +54,8 @@ export default function App() {
 
   const toastTimer = useRef(null)
   const abortRef = useRef(null)
+  const jobAbort = useRef(null)
+  const extractRequests = useRef(new Map()) // requestId -> docId (extrações em andamento)
   const selectToken = useRef(0)
   const annLoaded = useRef(null) // docId cujas anotações já foram carregadas
   const importing = useRef(false)
@@ -72,17 +68,6 @@ export default function App() {
     clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), kind === 'error' ? 8000 : 4200)
   }, [])
-
-  // ------------------------------------------------------------------ tema
-  useEffect(() => {
-    applyTheme(theme)
-    setPref('theme', theme)
-    if (theme !== 'auto' || !window.matchMedia) return undefined
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const on = () => applyTheme('auto')
-    mq.addEventListener?.('change', on)
-    return () => mq.removeEventListener?.('change', on)
-  }, [theme])
 
   // ---------------------------------------------------- erros que escapariam
   useEffect(() => {
@@ -106,7 +91,6 @@ export default function App() {
         // Clique rápido em outro PDF: a resposta antiga não pode sobrescrever.
         if (token !== selectToken.current) return
         setData(payload)
-        setScopeIds([id])
         setSeed(null)
         setSource(null)
         setReaderFocus(null)
@@ -204,16 +188,16 @@ export default function App() {
   }, [askPassword])
 
   /** Lê o PDF, extrai as páginas (figuras gravadas à medida que saem) e salva. */
-  async function convertPdf(doc, signal) {
+  async function convertPdf(doc, signal, prefix = '') {
     const url = convertFileSrc(doc.path)
-    setBusy({ label: 'Abrindo o PDF…', value: 0, cancellable: true, name: doc.name })
+    setBusy({ label: `${prefix}Abrindo o PDF…`, value: 0, cancellable: true, name: doc.name })
     const pdf = await loadPdf(url)
     let figures = 0
     const pages = await extractPages(pdf, {
       signal,
       onProgress: (n, total) =>
         setBusy({
-          label: `Convertendo página ${n} de ${total}…`,
+          label: `${prefix}Convertendo página ${n} de ${total}…`,
           value: n / total,
           cancellable: true,
           name: doc.name,
@@ -232,7 +216,7 @@ export default function App() {
     })
     for (const page of pages) page.figures = page.figures.filter((f) => !f.failed && f.path)
     if (textLength(pages) === 0) throw new NoTextError()
-    setBusy({ label: 'Guardando…', value: 1, cancellable: false, name: doc.name })
+    setBusy({ label: `${prefix}Guardando…`, value: 1, cancellable: false, name: doc.name })
     await api.savePages(doc.id, pages)
     return { pages: pages.length, figures }
   }
@@ -267,18 +251,14 @@ export default function App() {
         let created = null
         try {
           created = await api.importDoc(path)
-          if (paths.length > 1) notify(`Importando ${index + 1} de ${paths.length}: ${created.name}`)
-          await convertPdf(created, controller.signal)
+          await convertPdf(created, controller.signal, paths.length > 1 ? `${index + 1}/${paths.length} · ` : '')
           lastOk = created.id
         } catch (error) {
           if (created) {
             forgetPdf(convertFileSrc(created.path))
             await api.deleteDoc(created.id).catch(() => {})
           }
-          if (error?.name === 'AbortError') {
-            notify('Importação cancelada.')
-            break
-          }
+          if (error?.name === 'AbortError') break
           const reason = error?.name === 'NoTextError' ? `${error.message} O OCR ainda não é suportado.` : friendlyPdfError(error)
           notify(`Não foi possível processar o PDF: ${reason}`, 'error')
         }
@@ -287,7 +267,6 @@ export default function App() {
       if (lastOk) {
         setView('reader')
         await selectDoc(lastOk)
-        notify('PDF pronto para leitura.')
       }
     } catch (error) {
       notify(`Falha ao importar: ${errorText(error)}`, 'error')
@@ -308,9 +287,8 @@ export default function App() {
       await convertPdf(data.doc, controller.signal)
       setDocs(await api.listDocs())
       await selectDoc(data.doc.id)
-      notify('Texto reprocessado.')
     } catch (error) {
-      if (error?.name === 'AbortError') notify('Reprocessamento cancelado. O texto anterior foi mantido.')
+      if (error?.name === 'AbortError') notify('Reprocessamento cancelado; o texto anterior foi mantido.')
       else notify(`Falha ao reprocessar: ${error?.name === 'NoTextError' ? error.message : friendlyPdfError(error)}`, 'error')
     } finally {
       importing.current = false
@@ -331,7 +309,7 @@ export default function App() {
       const list = await api.listDocs()
       setDocs(list)
       setCells((prev) => prev.filter((cell) => cell.doc_id !== doc.id))
-      setScopeIds((prev) => prev.filter((id) => id !== doc.id))
+      setSelectedIds((prev) => prev.filter((id) => id !== doc.id))
       setSource((prev) => (prev?.doc.id === doc.id ? null : prev))
       if (currentIdRef.current === doc.id) {
         if (list.length) await selectDoc(list[0].id)
@@ -339,7 +317,6 @@ export default function App() {
           selectToken.current += 1
           setCurrentId(null)
           setData(null)
-          setScopeIds([])
         }
       }
     } catch (error) {
@@ -377,6 +354,7 @@ export default function App() {
   }, [notify])
 
   // --------------------------------------------------------------- fichamento
+  /** Salva a lista de colunas; devolve a lista gravada (com ids) ou null se falhar. */
   async function saveColumns(draft) {
     try {
       const next = await api.saveColumns(
@@ -388,56 +366,133 @@ export default function App() {
         })),
       )
       setColumns(next)
-      notify('Colunas salvas.')
-      return true
+      // Coluna excluída leva as células junto.
+      const ids = new Set(next.map((c) => c.id))
+      setCells((prev) => (prev.every((c) => ids.has(c.column_id)) ? prev : prev.filter((c) => ids.has(c.column_id))))
+      return next
     } catch (error) {
       notify(`Falha ao salvar colunas: ${errorText(error)}`, 'error')
-      return false
+      return null
     }
   }
 
-  async function extractDoc(doc) {
-    setBusy({ label: `Extraindo de "${doc.name}"…`, docId: doc.id })
+  /**
+   * Extrai para um conjunto de documentos, com no máximo EXTRACT_CONCURRENCY
+   * chamadas ao mesmo tempo (o backend também limita a 3 ao modelo). Cada
+   * documento leva um requestId; Cancelar chama cancel_chat para os que estão em
+   * andamento (nada deles é gravado) e impede os que ainda não começaram.
+   * As células vêm do retorno do `extract`; os eventos `cell` não são usados
+   * (repetiriam o mesmo dado), só `status` (nova tentativa) para mostrar na linha.
+   */
+  async function startExtraction({ docIds, mode = 'all', columnIds = null }) {
+    if (jobAbort.current) return
+    const scope = docs.filter((doc) => docIds.includes(doc.id) && doc.page_count > 0)
+    const tasks = planExtraction({ docs: scope, columns, cells, mode, columnIds })
+    if (!tasks.length) return
+    const controller = new AbortController()
+    jobAbort.current = controller
+    setJob({
+      total: tasks.length,
+      done: 0,
+      cancelling: false,
+      active: {},
+      queued: Object.fromEntries(tasks.map((t) => [t.doc.id, t.columnIds])),
+      status: {},
+    })
+    const without = (obj, key) => {
+      const { [key]: _drop, ...rest } = obj
+      return rest
+    }
+    const requests = extractRequests.current
+    requests.clear()
+    let outcomes = []
     try {
-      const updated = await api.extract(doc.id, null)
-      setCells((prev) => [...prev.filter((cell) => cell.doc_id !== doc.id), ...updated])
-      notify(`Fichamento de "${doc.name}" atualizado.`)
-    } catch (error) {
-      notify(`Falha ao extrair: ${errorText(error)}`, 'error')
+      outcomes = await runExtractionJob({
+        tasks,
+        extract: (docId, ids, requestId) => api.extract(docId, ids, requestId),
+        cancelRequest: (requestId) => api.cancelChat(requestId),
+        signal: controller.signal,
+        onStart: ({ doc, columnIds: ids }, requestId) => {
+          requests.set(requestId, doc.id)
+          setJob((j) => j && { ...j, active: { ...j.active, [doc.id]: ids }, queued: without(j.queued, doc.id) })
+        },
+        onFinish: ({ doc, columnIds: ids }, requestId, outcome) => {
+          requests.delete(requestId)
+          if (outcome.status === 'done') setCells((prev) => mergeCells(prev, outcome.cells, doc.id, ids))
+          else if (outcome.status === 'busy') notify(`"${doc.name}" já está sendo extraído. Aguarde terminar.`)
+          else if (outcome.status === 'error') notify(`Falha em "${doc.name}": ${errorText(outcome.error)}`, 'error')
+          setJob((j) => j && { ...j, active: without(j.active, doc.id), status: without(j.status, doc.id), done: j.done + 1 })
+        },
+      })
     } finally {
-      setBusy(null)
+      requests.clear()
+      jobAbort.current = null
+      setJob(null)
+    }
+    if (controller.signal.aborted) {
+      const saved = outcomes.filter((o) => o.status === 'done').length
+      notify(
+        saved
+          ? `Extração cancelada. ${saved} ${saved === 1 ? 'documento já estava gravado' : 'documentos já estavam gravados'}.`
+          : 'Extração cancelada. Nada foi gravado.',
+      )
     }
   }
 
-  async function extractAll() {
-    const ready = docs.filter((doc) => doc.page_count > 0)
-    if (!ready.length) return notify('Nenhum PDF processado na biblioteca.')
-    let failed = 0
-    for (let index = 0; index < ready.length; index += 1) {
-      const doc = ready[index]
-      setBusy({
-        label: `Extraindo ${index + 1} de ${ready.length}: ${doc.name}`,
-        docId: doc.id,
-        value: index / ready.length,
-      })
-      try {
-        const updated = await api.extract(doc.id, null)
-        setCells((prev) => [...prev.filter((cell) => cell.doc_id !== doc.id), ...updated])
-      } catch (error) {
-        failed += 1
-        notify(`Falha em "${doc.name}": ${errorText(error)}`, 'error')
-      }
-    }
-    setBusy(null)
-    if (!failed) notify('Fichamento concluído.')
+  function cancelExtraction() {
+    jobAbort.current?.abort()
+    setJob((j) => j && { ...j, cancelling: true, queued: {} })
   }
+
+  // Aviso de nova tentativa do backend (`status` com docId) aparece na linha do documento.
+  useEffect(() => {
+    let dead = false
+    let dispose = null
+    listen('ai', (event) => {
+      const data = event.payload
+      if (!data || data.type !== 'status' || !data.docId) return
+      if (extractRequests.current.get(data.id) !== data.docId) return
+      setJob((j) => j && { ...j, status: { ...j.status, [data.docId]: data.message || '' } })
+    })
+      .then((off) => {
+        if (dead) off()
+        else dispose = off
+      })
+      .catch(() => {})
+    return () => {
+      dead = true
+      dispose?.()
+    }
+  }, [])
+
+  async function renameDoc(doc, title) {
+    try {
+      const updated = await api.renameDoc(doc.id, title)
+      const apply = (d) => (d.id === doc.id ? { ...d, ...updated } : d)
+      setDocs((prev) => prev.map(apply))
+      setData((prev) => (prev && prev.doc.id === doc.id ? { ...prev, doc: apply(prev.doc) } : prev))
+      setSource((prev) => (prev && prev.doc.id === doc.id ? { ...prev, doc: apply(prev.doc) } : prev))
+    } catch (error) {
+      notify(`Não foi possível renomear: ${errorText(error)}`, 'error')
+    }
+  }
+
+  // Seleção só vale para documentos que existem e têm texto.
+  useEffect(() => {
+    setSelectedIds((prev) => pruneSelection(prev, docs))
+  }, [docs])
+
+  // Conjunto do assistente: os selecionados ou, sem seleção, o documento aberto.
+  const scopeIds = useMemo(
+    () => (selectedIds.length ? selectedIds : currentId ? [currentId] : []),
+    [selectedIds, currentId],
+  )
 
   /** Pergunta onde salvar (diálogo do sistema) e grava pelo backend; no navegador, baixa. */
   async function saveTextFile({ title, defaultName, ext, contents, mime }) {
     const path = await save({ defaultPath: defaultName, filters: [{ name: title, extensions: [ext] }] })
     if (!path) return false
-    const result = await api.writeTextFile(path, contents, { mime })
-    notify(result.saved ? `Salvo em ${path}` : `Baixado como ${String(path).split(/[\\/]/).pop()}.`)
+    await api.writeTextFile(path, contents, { mime })
     return true
   }
 
@@ -451,11 +506,10 @@ export default function App() {
       if (!path) return
       if (inTauri()) {
         await api.writeCsv(path, delimiter)
-        return notify(`CSV salvo em ${path}`)
+        return
       }
       const csv = buildFichamentoCsv({ docs, columns, cells }, { delimiter })
       downloadText(String(path).split(/[\\/]/).pop() || 'fichamento.csv', csv, 'text/csv')
-      notify('CSV baixado.')
     } catch (error) {
       notify(`Falha ao exportar: ${errorText(error)}`, 'error')
     }
@@ -568,6 +622,10 @@ export default function App() {
         }}
         onAdd={addDocs}
         onDelete={removeDoc}
+        onRename={renameDoc}
+        selectedIds={selectedIds}
+        onToggleSelect={(id) => setSelectedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))}
+        onClearSelection={() => setSelectedIds([])}
         busy={busy}
         dragging={dragging}
       />
@@ -679,12 +737,15 @@ export default function App() {
               docs={docs}
               columns={columns}
               cells={cells}
+              selectedIds={selectedIds}
+              onSelectedChange={setSelectedIds}
               onSaveColumns={saveColumns}
-              onExtract={extractDoc}
-              onExtractAll={extractAll}
+              onExtract={startExtraction}
+              onCancelJob={cancelExtraction}
+              job={job}
               onSource={setSource}
               onExport={exportCsv}
-              busy={busy}
+              onNotify={notify}
             />
           </Suspense>
         )}
@@ -713,7 +774,9 @@ export default function App() {
           <ChatPanel
             docs={docs}
             scopeIds={scopeIds}
-            setScopeIds={setScopeIds}
+            hasSelection={selectedIds.length > 0}
+            onDeselect={(id) => setSelectedIds((prev) => prev.filter((x) => x !== id))}
+            onClearSelection={() => setSelectedIds([])}
             hasKey={!!settings?.has_key}
             onOpenSettings={() => setSettingsOpen(true)}
             onSource={setSource}
@@ -749,8 +812,6 @@ export default function App() {
         {settingsOpen && (
           <SettingsModal
             settings={settings}
-            theme={theme}
-            onTheme={setTheme}
             onClose={() => setSettingsOpen(false)}
             onSaved={setSettings}
             onNotify={notify}

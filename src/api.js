@@ -51,6 +51,8 @@ export const api = {
   getDoc: (docId) => invoke('get_doc', { docId }),
   resolveEvidence: (docId, page, quote) => invoke('resolve_evidence', { docId, page, quote }),
   getEvidence: (id) => invoke('get_evidence', { id }),
+  /** Troca o título exibido; para restaurar, envie `original_title`. Devolve o Doc atualizado. */
+  renameDoc: (docId, title) => invoke('rename_doc', { docId, title }),
   deleteDoc: async (docId) => {
     await invoke('delete_doc', { docId })
     // O backend não conhece o que é só do frontend: limpa junto.
@@ -66,7 +68,9 @@ export const api = {
   saveColumns: (columns) => invoke('save_columns', { columns }),
   getCells: (docId) => invoke('get_cells', { docId: docId || null }),
   updateCell: (docId, columnId, value) => invoke('update_cell', { docId, columnId, value }),
-  extract: (docId, columnIds) => invoke('extract', { docId, columnIds: columnIds || null }),
+  /** `requestId` (um por documento) permite `cancelChat(requestId)` e liga os eventos `ai` ao documento. */
+  extract: (docId, columnIds, requestId) =>
+    invoke('extract', { docId, columnIds: columnIds || null, requestId: requestId || null }),
   /** delimiter: ',' (padrão) ou ';' (Excel em pt-BR). O arquivo leva BOM UTF-8. */
   writeCsv: (path, delimiter = ',') => invoke('write_csv', { path, delimiter }),
 

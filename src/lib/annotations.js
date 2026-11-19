@@ -1,10 +1,11 @@
 // Destaques coloridos com nota, ligados a uma página.
+// `hex` guarda a variável CSS da cor (definida em styles.css), não um hex fixo.
 export const COLORS = [
-  { id: 'yellow', name: 'Amarelo', hex: '#f6d860' },
-  { id: 'green', name: 'Verde', hex: '#8fd18a' },
-  { id: 'blue', name: 'Azul', hex: '#7db8f0' },
-  { id: 'pink', name: 'Rosa', hex: '#f1a0c4' },
-  { id: 'orange', name: 'Laranja', hex: '#f5a96b' },
+  { id: 'yellow', name: 'Amarelo', hex: 'var(--hl-yellow)' },
+  { id: 'green', name: 'Verde', hex: 'var(--hl-green)' },
+  { id: 'blue', name: 'Azul', hex: 'var(--hl-blue)' },
+  { id: 'pink', name: 'Rosa', hex: 'var(--hl-pink)' },
+  { id: 'orange', name: 'Laranja', hex: 'var(--hl-orange)' },
 ]
 
 export const COLOR_IDS = COLORS.map((c) => c.id)

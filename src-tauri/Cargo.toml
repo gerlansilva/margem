@@ -23,7 +23,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # rustls com as raízes do Mozilla E as do sistema (Windows/macOS): redes
 # corporativas com proxy TLS só funcionam com o repositório de certificados do SO.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"] }
-tokio = { version = "1", features = ["time", "macros"] }
+tokio = { version = "1", features = ["time", "macros", "sync"] }
 unicode-normalization = "0.1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }

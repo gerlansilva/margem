@@ -49,6 +49,7 @@ impl Db {
              CREATE TABLE IF NOT EXISTS documents(
                id TEXT PRIMARY KEY,
                name TEXT NOT NULL,
+               original_title TEXT NOT NULL DEFAULT '',
                path TEXT NOT NULL,
                page_count INTEGER NOT NULL DEFAULT 0,
                created_at TEXT NOT NULL
@@ -114,6 +115,11 @@ impl Db {
         ensure_column(&conn, "pages", "figures", "TEXT NOT NULL DEFAULT '[]'")?;
         ensure_column(&conn, "pages", "lines", "TEXT NOT NULL DEFAULT '[]'")?;
         ensure_column(&conn, "cells", "evidence", "TEXT NOT NULL DEFAULT '[]'")?;
+        // 0.2.0 -> 0.3: título original (para restaurar após renomear). Bancos antigos
+        // recebem o título atual; só preenche o que ainda está vazio, então é idempotente.
+        ensure_column(&conn, "documents", "original_title", "TEXT NOT NULL DEFAULT ''")?;
+        conn.execute("UPDATE documents SET original_title=name WHERE original_title=''", [])
+            .map_err(|e| format!("Falha ao migrar o banco de dados (documents.original_title): {e}"))?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -128,13 +134,14 @@ impl Db {
     pub fn insert_doc(&self, id: &str, name: &str, path: &str, created_at: &str) -> Result<Doc, String> {
         self.lock()
             .execute(
-                "INSERT INTO documents(id,name,path,page_count,created_at) VALUES(?,?,?,0,?)",
-                params![id, name, path, created_at],
+                "INSERT INTO documents(id,name,original_title,path,page_count,created_at) VALUES(?,?,?,?,0,?)",
+                params![id, name, name, path, created_at],
             )
             .map_err(|e| e.to_string())?;
         Ok(Doc {
             id: id.to_string(),
             name: name.to_string(),
+            original_title: name.to_string(),
             page_count: 0,
             path: path.to_string(),
             created_at: created_at.to_string(),
@@ -144,7 +151,7 @@ impl Db {
     pub fn list_docs(&self) -> Result<Vec<Doc>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT id,name,page_count,path,created_at FROM documents ORDER BY created_at DESC")
+            .prepare("SELECT id,name,page_count,path,created_at,original_title FROM documents ORDER BY created_at DESC")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| {
@@ -154,6 +161,7 @@ impl Db {
                     page_count: r.get(2)?,
                     path: r.get(3)?,
                     created_at: r.get(4)?,
+                    original_title: r.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -163,7 +171,7 @@ impl Db {
     pub fn get_doc(&self, id: &str) -> Result<Option<Doc>, String> {
         self.lock()
             .query_row(
-                "SELECT id,name,page_count,path,created_at FROM documents WHERE id=?",
+                "SELECT id,name,page_count,path,created_at,original_title FROM documents WHERE id=?",
                 params![id],
                 |r| {
                     Ok(Doc {
@@ -172,11 +180,26 @@ impl Db {
                         page_count: r.get(2)?,
                         path: r.get(3)?,
                         created_at: r.get(4)?,
+                        original_title: r.get(5)?,
                     })
                 },
             )
             .optional()
             .map_err(|e| e.to_string())
+    }
+
+    /// Muda só o título exibido (`documents.name`). Id, caminho, páginas, células,
+    /// anotações e evidências são ligados pelo id e não são tocados.
+    pub fn rename_doc(&self, id: &str, title: &str) -> Result<Doc, String> {
+        let title = crate::model::normalize_title(title)?;
+        let changed = self
+            .lock()
+            .execute("UPDATE documents SET name=? WHERE id=?", params![title, id])
+            .map_err(|e| e.to_string())?;
+        if changed == 0 {
+            return Err("Documento não encontrado.".into());
+        }
+        self.get_doc(id)?.ok_or_else(|| "Documento não encontrado.".to_string())
     }
 
     pub fn delete_doc(&self, id: &str) -> Result<(), String> {
@@ -344,6 +367,7 @@ impl Db {
         let map = |r: &rusqlite::Row| {
             let evidence: String = r.get(6)?;
             Ok(Cell {
+                doc_title: r.get(7)?,
                 doc_id: r.get(0)?,
                 column_id: r.get(1)?,
                 value: r.get(2)?,
@@ -356,14 +380,14 @@ impl Db {
         let out = match doc_id {
             Some(id) => {
                 let mut stmt = conn
-                    .prepare("SELECT doc_id,column_id,value,quote,page,status,evidence FROM cells WHERE doc_id=?")
+                    .prepare("SELECT c.doc_id,c.column_id,c.value,c.quote,c.page,c.status,c.evidence,COALESCE(d.name,'') FROM cells c LEFT JOIN documents d ON d.id=c.doc_id WHERE c.doc_id=?")
                     .map_err(|e| e.to_string())?;
                 let rows = stmt.query_map(params![id], map).map_err(|e| e.to_string())?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
             }
             None => {
                 let mut stmt = conn
-                    .prepare("SELECT doc_id,column_id,value,quote,page,status,evidence FROM cells")
+                    .prepare("SELECT c.doc_id,c.column_id,c.value,c.quote,c.page,c.status,c.evidence,COALESCE(d.name,'') FROM cells c LEFT JOIN documents d ON d.id=c.doc_id")
                     .map_err(|e| e.to_string())?;
                 let rows = stmt.query_map([], map).map_err(|e| e.to_string())?;
                 rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
@@ -742,6 +766,42 @@ mod tests {
         drop(db);
         Db::open(&path).unwrap();
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn migra_banco_020_sem_original_title_preenchendo_com_o_titulo_atual() {
+        let path = tmp_path("orig-title");
+        {
+            // esquema da 0.2.0: documents sem original_title, com um título já em uso
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE documents(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+                 INSERT INTO documents VALUES('d1','Título 0.2.0 — ç','/a.pdf',1,'2025-01-01');
+                 INSERT INTO documents VALUES('d2','Outro','/b.pdf',0,'2025-01-02');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let d1 = db.get_doc("d1").unwrap().unwrap();
+        assert_eq!((d1.name.as_str(), d1.original_title.as_str()), ("Título 0.2.0 — ç", "Título 0.2.0 — ç"));
+        db.rename_doc("d1", "Renomeado").unwrap();
+        drop(db);
+        // reabrir não refaz o preenchimento por cima do título original já gravado
+        let db = Db::open(&path).unwrap();
+        let d1 = db.get_doc("d1").unwrap().unwrap();
+        assert_eq!((d1.name.as_str(), d1.original_title.as_str()), ("Renomeado", "Título 0.2.0 — ç"));
+        assert_eq!(db.list_docs().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn insert_doc_guarda_o_titulo_original() {
+        let db = db();
+        let d = db.insert_doc("d1", "Original", "/a.pdf", "t").unwrap();
+        assert_eq!(d.original_title, "Original");
+        db.rename_doc("d1", "Outro").unwrap();
+        let got = db.list_docs().unwrap();
+        assert_eq!((got[0].name.as_str(), got[0].original_title.as_str()), ("Outro", "Original"));
     }
 
     #[test]

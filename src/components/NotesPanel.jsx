@@ -58,14 +58,7 @@ export function NotesPanel({ doc, annotations, onUpdate, onDelete, onGoTo, onAsk
 
       <div className="messages notes-list">
         {annotations.length === 0 && (
-          <div className="chat-empty">
-            <span className="chat-empty-mark">{Icon.highlighter({ className: 'ico' })}</span>
-            <h4>Nenhum destaque ainda</h4>
-            <p>
-              Selecione um trecho na leitura e escolha uma cor para destacar. “Nota” abre um campo para
-              escrever ao lado do trecho.
-            </p>
-          </div>
+          <p className="muted">Nenhum destaque.</p>
         )}
         {annotations.length > 0 && sorted.length === 0 && <p className="muted">Nada nesta cor.</p>}
         {sorted.map((ann) => (
@@ -96,7 +89,7 @@ export function NotesPanel({ doc, annotations, onUpdate, onDelete, onGoTo, onAsk
             <blockquote onClick={() => onGoTo(ann)}>{ann.text.length > 220 ? `${ann.text.slice(0, 220)}…` : ann.text}</blockquote>
             <textarea
               rows={ann.note ? 2 : 1}
-              placeholder="Adicionar nota…"
+              placeholder="Nota"
               aria-label={`Nota da página ${ann.page}`}
               value={ann.note || ''}
               onChange={(event) => onUpdate(ann.id, { note: event.target.value })}

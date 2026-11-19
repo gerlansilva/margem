@@ -13,6 +13,7 @@ export function shortcutList() {
     ['Ver atalhos', shortcut('/')],
     ['Parar a resposta · fechar', 'Esc'],
     ['Salvar nota', shortcut('Enter')],
+    ['Renomear documento', 'F2'],
   ]
 }
 

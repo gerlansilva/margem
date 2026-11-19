@@ -4,12 +4,6 @@ import { api, errorText } from '../api'
 import { Icon } from './Icons'
 import { Modal } from './Modal'
 
-const THEMES = [
-  ['auto', 'Automático (sistema)'],
-  ['light', 'Claro'],
-  ['dark', 'Escuro'],
-]
-
 /** Onde a chave em uso está guardada, em texto para o usuário. */
 export function keyStatus(settings) {
   const source = settings?.key_source || (settings?.has_key ? 'file' : 'none')
@@ -17,23 +11,23 @@ export function keyStatus(settings) {
   const vault = macOs ? 'Keychain' : 'Credential Manager'
   switch (source) {
     case 'keychain':
-      return { source, tone: 'ok', text: `Chave guardada no ${vault} do sistema.` }
+      return { source, tone: 'ok', text: `Guardada no ${vault}.` }
     case 'env':
-      return { source, tone: 'ok', text: 'Chave vinda da variável de ambiente DEEPSEEK_API_KEY.' }
+      return { source, tone: 'ok', text: 'Vinda de DEEPSEEK_API_KEY.' }
     case 'file':
       return {
         source,
         tone: 'warn',
         text: settings?.secure_storage
-          ? 'Chave guardada em arquivo (banco local). Salve a chave de novo para movê-la ao cofre do sistema.'
-          : 'Chave guardada em arquivo (banco local): o cofre do sistema não está disponível.',
+          ? 'Guardada em arquivo local. Salve de novo para mover ao cofre do sistema.'
+          : 'Guardada em arquivo local; o cofre do sistema não está disponível.',
       }
     default:
-      return { source: 'none', tone: 'none', text: 'Nenhuma chave configurada.' }
+      return { source: 'none', tone: 'none', text: 'Sem chave.' }
   }
 }
 
-export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNotify }) {
+export function SettingsModal({ settings, onClose, onSaved, onNotify }) {
   const [removing, setRemoving] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
@@ -46,7 +40,7 @@ export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNo
     event?.preventDefault()
     const url = baseUrl.trim()
     if (!/^https?:\/\//i.test(url)) {
-      setError('A Base URL precisa começar com http:// ou https://')
+      setError('A URL base precisa começar com http:// ou https://')
       return
     }
     setSaving(true)
@@ -79,7 +73,6 @@ export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNo
     try {
       const next = await api.clearApiKey()
       onSaved(next)
-      onNotify?.('Chave removida.')
     } catch (err) {
       setError(errorText(err))
     } finally {
@@ -93,7 +86,6 @@ export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNo
         <header className="modal-head">
           <div>
             <h3 id="settings-title">Configurações</h3>
-            <p>A chave fica no cofre do sistema, nesta máquina.</p>
           </div>
           <button type="button" className="icon-btn" onClick={onClose} aria-label="Fechar">
             {Icon.close({ className: 'ico' })}
@@ -102,12 +94,12 @@ export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNo
 
         <div className="form">
           <label>
-            Chave da API DeepSeek
+            Chave da API
             <span className="input-row">
               <input
                 data-autofocus
                 type={showKey ? 'text' : 'password'}
-                placeholder={settings?.has_key ? 'já configurada · deixe em branco para manter' : 'sk-...'}
+                placeholder={settings?.has_key ? 'Manter a atual' : 'sk-...'}
                 value={apiKey}
                 onChange={(event) => setApiKey(event.target.value)}
                 autoComplete="off"
@@ -136,23 +128,9 @@ export function SettingsModal({ settings, theme, onTheme, onClose, onSaved, onNo
             <input value={model} onChange={(event) => setModel(event.target.value)} spellCheck={false} />
           </label>
           <label>
-            Base URL (compatível com OpenAI)
+            URL base
             <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} spellCheck={false} />
           </label>
-          <label>
-            Tema
-            <select value={theme} onChange={(event) => onTheme(event.target.value)}>
-              {THEMES.map(([value, label]) => (
-                <option key={value} value={value}>
-                  {label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <p className="form-note">
-            Custo estimado: um artigo de 40 páginas gasta cerca de US$ 0,005 na primeira pergunta e menos de
-            US$ 0,001 nas seguintes, por causa do cache de contexto.
-          </p>
           {error && (
             <p className="msg-error" role="alert">
               {error}

@@ -4,7 +4,7 @@ const results = []
 const ok = (name, cond, extra = '') => { results.push([name, !!cond]); console.log(`${cond ? 'OK   ' : 'FALHA'} ${name} ${extra}`) }
 const { browser, page, errors } = await launch()
 const ask = async (q) => {
-  await page.getByPlaceholder(/Pergunte algo/).fill(q)
+  await page.getByPlaceholder(/Pergunte/).fill(q)
   await page.keyboard.press('Enter')
   await page.waitForSelector('.msg.assistant')
 }
@@ -73,7 +73,7 @@ try {
   await page.getByRole('button', { name: /Remover chave/ }).click()
   await page.waitForTimeout(600)
   const ks2 = await page.locator('[data-testid=key-status]').innerText()
-  ok('após remover: nenhuma chave', /Nenhuma chave/.test(ks2), ks2)
+  ok('após remover: nenhuma chave', /Sem chave/.test(ks2), ks2)
   ok('chamou clear_api_key', (await page.evaluate(() => window.__MOCK__.calls.some((c) => c.cmd === 'clear_api_key'))))
   await shot(page, '34-config-sem-chave')
   await page.keyboard.press('Escape')

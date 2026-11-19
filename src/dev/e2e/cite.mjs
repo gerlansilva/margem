@@ -2,7 +2,7 @@ import { launch, open, importPdf, shot, report } from './lib.mjs'
 const { browser, page, errors } = await launch()
 try {
   await open(page); await importPdf(page, 'artigo-2colunas')
-  await page.getByPlaceholder(/Pergunte algo/).fill('Qual a amostra e a tabela?')
+  await page.getByPlaceholder(/Pergunte/).fill('Qual a amostra e a tabela?')
   await page.keyboard.press('Enter')
   await page.waitForTimeout(3000)
   const cites = page.locator('.msg.assistant .cite')

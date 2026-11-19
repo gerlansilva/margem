@@ -81,7 +81,7 @@ mod tests {
     use super::*;
 
     fn doc(id: &str, name: &str) -> Doc {
-        Doc { id: id.into(), name: name.into(), page_count: 1, path: "".into(), created_at: "".into() }
+        Doc { id: id.into(), name: name.into(), original_title: name.into(), page_count: 1, path: "".into(), created_at: "".into() }
     }
     fn col(id: &str, name: &str) -> Column {
         Column { id: id.into(), name: name.into(), instruction: "".into(), kind: "text".into() }
@@ -89,6 +89,7 @@ mod tests {
     fn cell(d: &str, c: &str, v: Option<&str>, q: Option<&str>, p: Option<i64>) -> Cell {
         Cell {
             doc_id: d.into(),
+            doc_title: String::new(),
             column_id: c.into(),
             value: v.map(Into::into),
             quote: q.map(Into::into),

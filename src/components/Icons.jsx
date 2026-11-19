@@ -134,4 +134,21 @@ export const Icon = {
       <path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
     </svg>
   ),
+  pencil: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M4 20h4L19 9a2.1 2.1 0 0 0-3-3L5 17l-1 3Z" />
+      <path d="m14.5 7.5 3 3" />
+    </svg>
+  ),
+  undo: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M9 14 4 9l5-5" />
+      <path d="M4 9h10a6 6 0 0 1 0 12h-3" />
+    </svg>
+  ),
+  more: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M5 12h.01M12 12h.01M19 12h.01" strokeWidth="2.4" />
+    </svg>
+  ),
 }

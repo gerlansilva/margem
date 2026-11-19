@@ -663,6 +663,7 @@ mod tests {
         Doc {
             id: "d1".into(),
             name: "Artigo".into(),
+            original_title: "Artigo".into(),
             page_count: 2,
             path: "/tmp/a.pdf".into(),
             created_at: "".into(),

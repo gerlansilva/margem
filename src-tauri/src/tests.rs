@@ -6,6 +6,7 @@ use crate::ai::{self, DocContext};
 use crate::db::Db;
 use crate::export;
 use crate::fichamento;
+use crate::model;
 use crate::model::{Block, Column, Doc, Line, Msg, Page};
 use crate::net::{self, SseItem, SseParser};
 
@@ -32,6 +33,7 @@ fn artigo() -> (Doc, Vec<Page>) {
     let doc = Doc {
         id: "d1".into(),
         name: "Lopes (2012) — Educação Estatística no Brasil".into(),
+        original_title: "Lopes (2012) — Educação Estatística no Brasil".into(),
         page_count: 3,
         path: "/dados/uploads/d1.pdf".into(),
         created_at: "2026-01-01T00:00:00Z".into(),
@@ -254,4 +256,165 @@ fn json_de_erro_com_status_200_nao_vira_resposta_vazia_silenciosa() {
     assert!(parser.finish().is_empty());
     let msg = net::provider_message(parser.stray()).unwrap();
     assert!(msg.contains("Insufficient Balance"), "{msg}");
+}
+
+// ------------------------------------------------- 0.3: renomear e extração em lote
+
+const Q1: &str = "A amostra de professores foi composta por 120 participantes de 15 estados";
+const Q2: &str = "produzidas em 56 universidades brasileiras";
+
+fn banco_com(ids: &[&str]) -> Db {
+    let db = Db::open_in_memory().unwrap();
+    for id in ids {
+        let (doc, pages) = artigo();
+        db.insert_doc(id, &doc.name, &format!("/dados/uploads/{id}.pdf"), &doc.created_at).unwrap();
+        db.save_pages(id, &pages).unwrap();
+    }
+    db
+}
+
+fn resp_col(col_id: &str, value: &str, quote: &str) -> Vec<ai::RawCell> {
+    raw(&format!(r#"[{{"column_id":"{col_id}","value":"{value}","quote":"{quote}","page":2}}]"#))
+}
+
+#[test]
+fn extrair_uma_coluna_nova_nao_mexe_nas_outras_celulas() {
+    let db = banco_com(&["d1"]);
+    let pages = db.pages("d1").unwrap();
+    let (c1, c2) = (col("c1", "Amostra", "n"), col("c2", "Universidades", "n"));
+    fichamento::apply_cells(&db, "d1", &pages, std::slice::from_ref(&c1), resp_col("c1", "120", Q1)).unwrap();
+    db.put_cell("d1", "c1", Some("120 (editado à mão)"), Some(Q1), Some(2), "edited", &[]).unwrap();
+    // agora só a coluna nova; o modelo (mal comportado) ainda devolve c1 junto
+    let resp = raw(&format!(
+        r#"[{{"column_id":"c2","value":"56","quote":"{Q2}","page":2}},{{"column_id":"c1","value":"999","quote":"{Q1}","page":2}}]"#
+    ));
+    fichamento::apply_cells(&db, "d1", &pages, std::slice::from_ref(&c2), resp).unwrap();
+    let cells = db.cells(Some("d1")).unwrap();
+    let get = |id: &str| cells.iter().find(|c| c.column_id == id).unwrap().clone();
+    assert_eq!(get("c1").value.as_deref(), Some("120 (editado à mão)"));
+    assert_eq!(get("c1").status, "edited");
+    assert_eq!(get("c2").value.as_deref(), Some("56"));
+    assert_eq!(cells.len(), 2);
+}
+
+#[test]
+fn colunas_pedidas_sem_resposta_viram_not_found_sem_apagar_preenchidas() {
+    let db = banco_com(&["d1"]);
+    let pages = db.pages("d1").unwrap();
+    let (c1, c2, c3) = (col("c1", "A", "n"), col("c2", "B", "n"), col("c3", "C", "n"));
+    fichamento::apply_cells(&db, "d1", &pages, std::slice::from_ref(&c1), resp_col("c1", "120", Q1)).unwrap();
+    fichamento::apply_cells(&db, "d1", &pages, &[c2, c3], resp_col("c2", "56", Q2)).unwrap();
+    let cells = db.cells(Some("d1")).unwrap();
+    let status = |id: &str| cells.iter().find(|c| c.column_id == id).unwrap().status.clone();
+    assert_eq!((status("c1").as_str(), status("c2").as_str(), status("c3").as_str()), ("filled", "filled", "not_found"));
+}
+
+#[test]
+fn varios_documentos_extraidos_em_paralelo_nao_se_misturam() {
+    let ids = ["d1", "d2", "d3"];
+    let db = std::sync::Arc::new(banco_com(&ids));
+    let handles: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            let db = db.clone();
+            let id = id.to_string();
+            std::thread::spawn(move || {
+                let pages = db.pages(&id).unwrap();
+                let cols = vec![col("c1", "A", "n"), col("c2", "B", "n")];
+                let resp = raw(&format!(
+                    r#"[{{"column_id":"c1","value":"v-{id}","quote":"{Q1}","page":2}},{{"column_id":"c2","value":"w-{id}","quote":"{Q2}","page":2}}]"#
+                ));
+                fichamento::apply_cells(&db, &id, &pages, &cols, resp).unwrap();
+                db.cells(Some(&id)).unwrap();
+                db.cells(None).unwrap();
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    for id in ids {
+        let cells = db.cells(Some(id)).unwrap();
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells.iter().find(|c| c.column_id == "c1").unwrap().value.as_deref(), Some(format!("v-{id}").as_str()));
+        assert_eq!(cells.iter().find(|c| c.column_id == "c2").unwrap().value.as_deref(), Some(format!("w-{id}").as_str()));
+        assert!(cells.iter().all(|c| c.evidence.len() == 1 && c.doc_id == id));
+    }
+    assert_eq!(db.cells(None).unwrap().len(), 6);
+}
+
+#[test]
+fn eventos_de_celula_por_coluna_pedida() {
+    let db = banco_com(&["d1"]);
+    let pages = db.pages("d1").unwrap();
+    let cols = vec![col("c1", "A", "n"), col("c2", "B", "n")];
+    fichamento::apply_cells(&db, "d1", &pages, &cols, resp_col("c1", "120", Q1)).unwrap();
+    let cells = db.cells(Some("d1")).unwrap();
+    let ev = fichamento::cell_events("req9", "d1", &cols[..1], &cells);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0]["type"], "cell");
+    assert_eq!(ev[0]["id"], "req9");
+    assert_eq!(ev[0]["docId"], "d1");
+    assert_eq!(ev[0]["columnId"], "c1");
+    assert_eq!(ev[0]["cell"]["value"], "120");
+    assert_eq!(ev[0]["cell"]["doc_title"], doc_titulo());
+}
+
+fn doc_titulo() -> String {
+    artigo().0.name
+}
+
+#[test]
+fn renomear_preserva_id_caminho_e_vinculos() {
+    let db = banco_com(&["d1", "d2"]);
+    let pages = db.pages("d1").unwrap();
+    fichamento::apply_cells(&db, "d1", &pages, &[col("c1", "A", "n")], resp_col("c1", "120", Q1)).unwrap();
+    db.save_annotations(
+        "d1",
+        &[model::Annotation {
+            id: "a1".into(), doc_id: "d1".into(), page: 1, color: "yellow".into(), text: "t".into(),
+            note: "n".into(), anchor: Default::default(), created_at: String::new(), updated_at: String::new(),
+        }],
+    )
+    .unwrap();
+    let antes = db.get_doc("d1").unwrap().unwrap();
+    let novo = db.rename_doc("d1", "  Lopes   (2012)\n— versão final ").unwrap();
+    assert_eq!(novo.name, "Lopes (2012) — versão final");
+    assert_eq!((novo.id.as_str(), novo.path.as_str(), novo.page_count), (antes.id.as_str(), antes.path.as_str(), antes.page_count));
+    assert_eq!(novo.original_title, antes.name);
+    // o outro documento não muda; ligações continuam
+    assert_eq!(db.get_doc("d2").unwrap().unwrap().name, antes.name);
+    assert_eq!(db.pages("d1").unwrap().len(), 3);
+    assert_eq!(db.list_annotations("d1").unwrap().len(), 1);
+    let cells = db.cells(None).unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].doc_title, "Lopes (2012) — versão final"); // get_cells traz o título atual
+    assert_eq!(db.cells(Some("d1")).unwrap()[0].doc_title, "Lopes (2012) — versão final");
+    // restaurar = reenviar original_title
+    let volta = db.rename_doc("d1", &novo.original_title).unwrap();
+    assert_eq!(volta.name, antes.name);
+    // a extração depois de renomear continua gravando no mesmo doc
+    fichamento::apply_cells(&db, "d1", &pages, &[col("c2", "B", "n")], resp_col("c2", "56", Q2)).unwrap();
+    assert_eq!(db.cells(Some("d1")).unwrap().len(), 2);
+}
+
+#[test]
+fn renomear_rejeita_vazio_longo_e_documento_inexistente() {
+    let db = banco_com(&["d1"]);
+    assert!(db.rename_doc("d1", "").is_err());
+    assert!(db.rename_doc("d1", "   \n ").is_err());
+    assert!(db.rename_doc("d1", &"x".repeat(201)).is_err());
+    assert_eq!(db.rename_doc("nao-existe", "Título").unwrap_err(), "Documento não encontrado.");
+    assert_eq!(db.get_doc("d1").unwrap().unwrap().name, artigo().0.name); // nada mudou
+}
+
+#[test]
+fn csv_usa_titulo_renomeado() {
+    let db = banco_com(&["d1"]);
+    let pages = db.pages("d1").unwrap();
+    let cols = vec![col("c1", "A", "n")];
+    fichamento::apply_cells(&db, "d1", &pages, &cols, resp_col("c1", "120", Q1)).unwrap();
+    db.rename_doc("d1", "Título novo").unwrap();
+    let csv = export::csv_string(&db.list_docs().unwrap(), &cols, &db.cells(None).unwrap(), ',');
+    assert!(csv.contains("Título novo,120"), "{csv}");
 }
