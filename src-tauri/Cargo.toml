@@ -1,6 +1,6 @@
 [package]
 name = "pdf-deepseek"
-version = "0.1.0"
+version = "0.2.0"
 description = "Leitor de PDF com chat, citações e fichamento"
 authors = ["Gerlan Silva"]
 edition = "2021"
@@ -16,14 +16,30 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# rustls com as raízes do Mozilla E as do sistema (Windows/macOS): redes
+# corporativas com proxy TLS só funcionam com o repositório de certificados do SO.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"] }
+tokio = { version = "1", features = ["time", "macros"] }
+unicode-normalization = "0.1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 base64 = "0.22"
+
+# Cofre do sistema: Keychain (macOS) e Credential Manager (Windows). Em outras
+# plataformas a chave cai no SQLite (ver secrets.rs / keystore.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(margem_keyring)'] }
 
 [profile.release]
 codegen-units = 1

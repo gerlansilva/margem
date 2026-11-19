@@ -32,10 +32,24 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-createRoot(document.getElementById('root')).render(
-  <React.StrictMode>
-    <ErrorBoundary>
-      <App />
-    </ErrorBoundary>
-  </React.StrictMode>,
-)
+async function start() {
+  // Backend falso para testes no navegador: `vite --mode mock`. Em produção a
+  // condição é falsa em tempo de build e o módulo inteiro sai do bundle.
+  if (import.meta.env.MODE === 'mock') {
+    const { installTauriMock } = await import('./dev/tauri-mock')
+    installTauriMock()
+  }
+  render()
+}
+
+function render() {
+  createRoot(document.getElementById('root')).render(
+    <React.StrictMode>
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
+    </React.StrictMode>,
+  )
+}
+
+start()

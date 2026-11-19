@@ -15,7 +15,25 @@ A pergunta nasce na margem: você lê o artigo, anota uma dúvida ao lado do par
 - **Seleciona um trecho** na leitura e pergunta sobre ele.
 - **Compara documentos**: outro PDF entra no escopo do chat (D1, D2…) e a pergunta pode comparar os dois.
 - **Fichamento**: você define as colunas (nome + instrução). A IA preenche cada célula com valor, trecho literal e página; sem trecho verificado a célula fica "não encontrado". Exporta CSV.
-- **Chave da DeepSeek no SQLite local**, nunca em arquivo de configuração do projeto.
+- **Destaques e notas**: selecione um trecho na leitura, escolha uma de cinco cores e, se quiser, escreva uma nota. Ficam no banco local (SQLite), por documento, e saem em Markdown.
+- **Exportações**: conversa e notas em Markdown (`.md`), fichamento em CSV com vírgula ou ponto e vírgula (UTF-8 com BOM, abre certo no Excel em português). O app abre o diálogo "Salvar" do sistema e só grava `.md`, `.txt` e `.csv`.
+- **Respostas verificáveis**: se o modelo cita uma página que não foi enviada a ele, a citação aparece tracejada e com aviso. Resposta cortada pelo limite do modelo é sinalizada. Em falha de rede o chat mostra "Nova tentativa em 2 s…" antes de desistir.
+- **Chave da DeepSeek no cofre do sistema** (Keychain no macOS, Credential Manager no Windows), nunca em arquivo do projeto. Em Configurações aparece onde a chave está guardada e há o botão **Remover chave**.
+
+## Atalhos
+
+No macOS use Cmd no lugar de Ctrl.
+
+| Atalho | Ação |
+| --- | --- |
+| Ctrl+O | Adicionar PDF |
+| Ctrl+F | Buscar no documento (Enter / Shift+Enter: próximo / anterior) |
+| Ctrl+K | Perguntar ao assistente |
+| Ctrl+1 / Ctrl+2 | Leitura / Fichamento |
+| Ctrl+, | Configurações |
+| Ctrl+/ | Ver atalhos |
+| Ctrl+Enter | Salvar a nota |
+| Esc | Parar a resposta; fechar janelas |
 
 ## Como funciona
 
@@ -32,15 +50,26 @@ npm install
 npm run app
 ```
 
-Na primeira execução, abra **Configurações** (engrenagem) e cole a chave da DeepSeek. Também é possível usar `DEEPSEEK_API_KEY`.
+Na primeira execução, abra **Configurações** (engrenagem) e cole a chave da DeepSeek. Também é possível usar a variável `DEEPSEEK_API_KEY` (ela tem prioridade e não pode ser removida pelo app).
 
 Modelo padrão: `deepseek-flash`. A base URL e o modelo são configuráveis, então qualquer endpoint compatível com OpenAI funciona.
 
-Build de produção:
+Build de produção local (gera o instalador do sistema em que você está):
 
 ```sh
 npm run tauri build
 ```
+
+### Instaladores para Windows e macOS
+
+O workflow `.github/workflows/build.yml` (GitHub Actions) roda em push na `main`, em pull request e manualmente. Ele faz o build da interface, roda `cargo test` e `clippy` no macOS e no Windows e gera os instaladores:
+
+- **Windows**: `.exe` (NSIS, instala só para o usuário) e `.msi`.
+- **macOS**: `.dmg` universal (Apple Silicon e Intel).
+
+Os arquivos ficam como artefatos da execução (14 dias). Ao empurrar uma tag `v*` (por exemplo `v0.2.0`) o workflow também cria um release rascunho com os instaladores.
+
+**Aviso: os builds para Mac não são assinados nem notarizados.** Na primeira abertura o macOS bloqueia o app: arraste o Margem para Aplicativos, clique com o botão direito, escolha **Abrir** e confirme (ou, em Ajustes do Sistema > Privacidade e Segurança, **Abrir mesmo assim**). No Windows, o SmartScreen também pode avisar que o editor é desconhecido (**Mais informações > Executar assim mesmo**).
 
 ## Custo por pergunta
 
@@ -52,11 +81,18 @@ O histórico volta só com as últimas seis mensagens, para uma resposta longa a
 
 ## Onde ficam os dados
 
-- Banco: `~/Library/Application Support/br.com.gerlan.pdfchat/pdfchat.sqlite3`
-- PDFs: `.../uploads/`
-- Figuras recortadas: `.../figures/<doc>/<página>-<n>.png`
+- **Windows**: `%LOCALAPPDATA%\br.com.gerlan.pdfchat\` (normalmente `C:\Users\<você>\AppData\Local\br.com.gerlan.pdfchat`)
+- **macOS**: `~/Library/Application Support/br.com.gerlan.pdfchat/`
 
-A chave fica no SQLite local. Para um app distribuído, o próximo passo é movê-la para o Keychain do macOS com o crate `keyring`.
+Dentro dela:
+
+- Banco (documentos, páginas, fichamento, destaques e notas): `pdfchat.sqlite3`
+- PDFs importados: `uploads/`
+- Figuras recortadas: `figures/<doc>/<página>-<n>.png`
+
+A chave da API **não** fica no banco: vai para o Keychain (macOS) ou o Credential Manager (Windows). Chaves que versões antigas guardavam no SQLite são movidas para o cofre automaticamente na primeira abertura; só se o cofre do sistema não estiver disponível a chave cai de volta para o banco, e as Configurações avisam. Os destaques da versão 0.1 (que ficavam no armazenamento do navegador embutido) são migrados para o banco uma única vez, ao abrir o documento.
+
+Para apagar tudo, feche o app e remova essa pasta (e a chave, em Configurações > Remover chave).
 
 ## Identidade
 
@@ -102,10 +138,13 @@ src/                 React
   pdf.js             extração pdf.js + montagem de páginas/blocos/linhas
   components/        leitor, chat, fichamento, modal de origem, logo
 src-tauri/src/
-  lib.rs             comandos Tauri (importar, salvar páginas, chat, extrair)
+  lib.rs             comandos Tauri (importar, chat, extrair, destaques, exportar)
   ai.rs              prompts, contexto com marcadores de página, validação de quotes
   evidence.rs        citação -> sequência de linhas + retângulos de destaque
-  db.rs              SQLite (rusqlite)
+  db.rs              SQLite (rusqlite), com migração de bancos antigos
+  export.rs          CSV (vírgula ou ponto e vírgula, BOM)
+  files.rs           caminhos seguros e gravação de .md/.txt/.csv
+  secrets.rs         chave da API no cofre do sistema (keystore.rs)
   model.rs           tipos compartilhados
 src-tauri/icons/     ícone do app (gerado a partir de docs/logo.png)
 ```
@@ -113,11 +152,22 @@ src-tauri/icons/     ícone do app (gerado a partir de docs/logo.png)
 ## Testes
 
 ```sh
-npm run build
-cd src-tauri && cargo test
+npm test                      # vitest: citações, CSV, exportação, anotações, api.js
+npm run build                 # o build da interface também precisa passar
+cd src-tauri && cargo test --lib
+cargo clippy --lib --tests    # dentro de src-tauri
 ```
 
-Os testes Rust cobrem a resolução de citação (linha única, duas linhas, hífen quebrado, palavra flexionada pela IA, citação inexistente) e a montagem do contexto do chat (seleção de páginas por pergunta, pergunta genérica, histórico curto).
+Para ver a interface inteira no navegador, sem o Rust, use o backend simulado (`src/dev/tauri-mock.js`):
+
+```sh
+npm run mock                  # abre em http://localhost:1420
+node src/dev/e2e/flows.mjs    # roteiros Playwright contra o mock (também: more, full, cite, integr)
+```
+
+Os roteiros usam o Chrome do sistema (`CHROME=/caminho/chrome`) e PDFs de teste em `MARGEM_FIXTURES` (padrão `/tmp/margem-fixtures`). O mock não substitui o teste no app real: Keychain, Credential Manager, diálogos nativos e arrastar-e-soltar só se verificam no Tauri.
+
+Os testes Rust cobrem o banco (inclusive a migração de bancos da 0.1 e os destaques), a gravação de arquivos, o CSV com os dois delimitadores, a resolução de citação (linha única, duas linhas, hífen quebrado, palavra flexionada pela IA, citação inexistente) e a montagem do contexto do chat (seleção de páginas por pergunta, pergunta genérica, histórico curto).
 
 Casos verificados no app com artigos reais:
 
@@ -133,5 +183,6 @@ Casos verificados no app com artigos reais:
 - Tabela de largura total em página de duas colunas pode degradar para texto.
 - Referências de duas colunas podem perder a continuação de uma entrada longa.
 - Fichamento manual: a célula ainda não é editável na interface; a extração é sempre pela IA.
+- Builds sem assinatura (veja acima); atualização automática ainda não existe.
 - Ainda não há busca full-text na biblioteca.
 - Uma pergunta cujo assunto não aparece em nenhuma página selecionada pode receber "não encontrado". Citar a seção ("nas considerações finais…") resolve.

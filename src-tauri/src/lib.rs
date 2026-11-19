@@ -1,12 +1,20 @@
 mod ai;
+mod cancel;
 mod db;
 mod evidence;
+mod export;
+mod fichamento;
+mod files;
+mod keystore;
 mod model;
+mod net;
+mod secrets;
+#[cfg(test)]
+mod tests;
 
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -14,46 +22,94 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use ai::DocContext;
+use cancel::CancelRegistry;
 use db::Db;
 use model::{Cell, ChatRequest, Column, Doc, Evidence, Page};
-
-use base64::Engine as _;
+use net::NetErrorKind;
+use secrets::{KeySource, SecretStore};
 
 const DEFAULT_MODEL: &str = "deepseek-flash";
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
+/// Chave do SQLite onde a chave da API ficava antes do cofre do sistema.
+const KEY_SETTING: &str = "api_key";
+/// Espera pelo início da resposta do chat (o stream em si não tem teto total).
+const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
+/// Extração não usa stream: o corpo só chega quando o modelo termina.
+const EXTRACT_TIMEOUT: Duration = Duration::from_secs(360);
+const MAX_FIGURE_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct AppState {
     db: Db,
     http: reqwest::Client,
-    cancelled: Mutex<HashSet<String>>,
+    cancel: CancelRegistry,
+    vault: Box<dyn SecretStore>,
 }
 
-fn api_key(state: &AppState) -> Result<String, String> {
-    std::env::var("DEEPSEEK_API_KEY")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| state.db.setting("api_key"))
-        .ok_or_else(|| "Configure a chave da DeepSeek nas configurações.".to_string())
+struct AiConfig {
+    key: String,
+    model: String,
+    base_url: String,
 }
 
-fn model_name(state: &AppState) -> String {
-    std::env::var("DEEPSEEK_MODEL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| state.db.setting("model"))
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-fn base_url(state: &AppState) -> String {
-    std::env::var("DEEPSEEK_BASE_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| state.db.setting("base_url"))
-        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+impl AppState {
+    fn api_key(&self) -> (Option<String>, KeySource) {
+        secrets::resolve_key(env_value("DEEPSEEK_API_KEY"), &*self.vault, self.db.setting(KEY_SETTING))
+    }
+
+    fn model(&self) -> String {
+        env_value("DEEPSEEK_MODEL")
+            .or_else(|| self.db.setting("model"))
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+    }
+
+    fn base_url(&self) -> String {
+        env_value("DEEPSEEK_BASE_URL")
+            .or_else(|| self.db.setting("base_url"))
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+    }
+
+    fn ai_config(&self) -> Result<AiConfig, String> {
+        let (key, _) = self.api_key();
+        let key = key.ok_or_else(|| "Configure a chave da DeepSeek nas configurações.".to_string())?;
+        let base_url = net::validate_base_url(&self.base_url())
+            .map_err(|e| format!("URL base inválida nas configurações: {e}"))?;
+        Ok(AiConfig { key, model: self.model(), base_url })
+    }
+
+    fn settings_json(&self) -> Value {
+        let (key, source) = self.api_key();
+        json!({
+            "has_key": key.is_some(),
+            // "env" | "keychain" | "file" | "none": onde a chave em uso está guardada.
+            "key_source": source,
+            // O cofre do sistema (Keychain/Credential Manager) está funcionando?
+            "secure_storage": self.vault.get().is_ok(),
+            "model": self.model(),
+            "base_url": self.base_url()
+        })
+    }
 }
 
 fn short_id() -> String {
     Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+/// Pasta de dados do app. No Windows usa AppData\Local (não a Roaming, que
+/// sincroniza com o perfil de domínio): banco e PDFs podem ser grandes.
+fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_local_data_dir()
+        .map_err(|e| format!("Não foi possível localizar a pasta de dados do aplicativo: {e}"))
+}
+
+fn emit_ai(app: &AppHandle, payload: Value) {
+    if let Err(e) = app.emit("ai", payload) {
+        eprintln!("falha ao emitir evento ai: {e}");
+    }
 }
 
 // ------------------------------------------------------------- documentos
@@ -64,32 +120,24 @@ fn import_doc(app: AppHandle, state: State<'_, AppState>, path: String) -> Resul
     if !source.is_file() {
         return Err("Arquivo não encontrado.".into());
     }
-    if source
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase())
-        != Some("pdf".to_string())
-    {
+    if !files::has_pdf_extension(&source) {
         return Err("Envie um arquivo PDF.".into());
     }
+    if !files::looks_like_pdf(&source) {
+        return Err("O arquivo não parece ser um PDF válido.".into());
+    }
     let id = short_id();
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("uploads");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = data_dir(&app)?.join("uploads");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Não foi possível criar a pasta de PDFs: {e}"))?;
     let dest = dir.join(format!("{id}.pdf"));
     std::fs::copy(&source, &dest).map_err(|e| format!("Falha ao copiar o PDF: {e}"))?;
-    let name = source
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Documento")
-        .to_string();
     let created = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     state
         .db
-        .insert_doc(&id, &name, dest.to_string_lossy().as_ref(), &created)
+        .insert_doc(&id, &files::display_name(&source), dest.to_string_lossy().as_ref(), &created)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&dest);
+        })
 }
 
 #[tauri::command]
@@ -106,10 +154,17 @@ fn get_doc(state: State<'_, AppState>, doc_id: String) -> Result<Value, String> 
 
 #[tauri::command]
 fn delete_doc(app: AppHandle, state: State<'_, AppState>, doc_id: String) -> Result<(), String> {
+    let base = data_dir(&app).ok();
     if let Some(doc) = state.db.get_doc(&doc_id)? {
-        let _ = std::fs::remove_file(doc.path);
+        // Só apaga o que o próprio app copiou; nunca um caminho arbitrário vindo do banco.
+        let inside = base
+            .as_ref()
+            .is_some_and(|b| files::is_inside(std::path::Path::new(&doc.path), &b.join("uploads")));
+        if inside {
+            let _ = std::fs::remove_file(&doc.path);
+        }
     }
-    if let Ok(dir) = app.path().app_data_dir() {
+    if let (Some(dir), true) = (base, files::is_safe_id(&doc_id)) {
         let _ = std::fs::remove_dir_all(dir.join("figures").join(&doc_id));
     }
     state.db.delete_doc(&doc_id)
@@ -120,7 +175,7 @@ fn save_pages(state: State<'_, AppState>, doc_id: String, pages: Vec<Page>) -> R
     state.db.save_pages(&doc_id, &pages)
 }
 
-/// Grava o recorte de uma figura/quadro em app_data/figures/<doc>/<página>-<n>.png.
+/// Grava o recorte de uma figura/quadro em <dados>/figures/<doc>/<página>-<n>.png.
 #[tauri::command]
 fn save_figure(
     app: AppHandle,
@@ -129,19 +184,24 @@ fn save_figure(
     index: i64,
     data: String,
 ) -> Result<String, String> {
-    let raw = data.split(',').nth(1).unwrap_or(&data);
+    if !files::is_safe_id(&doc_id) {
+        return Err("Identificador de documento inválido.".into());
+    }
+    if page < 0 || index < 0 {
+        return Err("Página ou índice da figura inválido.".into());
+    }
+    let raw = data.split_once(',').map(|(_, rest)| rest).unwrap_or(&data);
+    if raw.len() > MAX_FIGURE_BYTES * 4 / 3 + 16 {
+        return Err("A figura é grande demais.".into());
+    }
+    use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw)
+        .decode(raw.trim())
         .map_err(|e| format!("Figura inválida: {e}"))?;
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("figures")
-        .join(&doc_id);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dir = data_dir(&app)?.join("figures").join(&doc_id);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Não foi possível criar a pasta de figuras: {e}"))?;
     let path = dir.join(format!("{page}-{index}.png"));
-    std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+    std::fs::write(&path, bytes).map_err(|e| format!("Não foi possível gravar a figura: {e}"))?;
     Ok(path.to_string_lossy().to_string())
 }
 
@@ -149,11 +209,7 @@ fn save_figure(
 
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> Value {
-    json!({
-        "has_key": api_key(&state).is_ok(),
-        "model": model_name(&state),
-        "base_url": base_url(&state)
-    })
+    state.settings_json()
 }
 
 #[tauri::command]
@@ -163,16 +219,169 @@ fn save_settings(
     model: Option<String>,
     base_url: Option<String>,
 ) -> Result<Value, String> {
-    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        state.db.set_setting("api_key", key.trim())?;
+    // Valida tudo antes de gravar qualquer coisa: salvar pela metade confunde.
+    let key = api_key
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| net::clean_api_key(&k))
+        .transpose()?;
+    let model = model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+    if model.as_deref().is_some_and(|m| m.chars().count() > 100 || m.chars().any(char::is_whitespace)) {
+        return Err("O nome do modelo é inválido.".into());
     }
-    if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
-        state.db.set_setting("model", m.trim())?;
+    let base_url = base_url
+        .filter(|b| !b.trim().is_empty())
+        .map(|b| net::validate_base_url(&b))
+        .transpose()?;
+
+    if let Some(key) = key {
+        match secrets::save_key(&*state.vault, &key) {
+            // No cofre e conferido: a cópia em texto puro do SQLite some.
+            Ok(()) => state.db.delete_setting(KEY_SETTING)?,
+            Err(why) => {
+                eprintln!("cofre indisponível, guardando a chave no arquivo: {why}");
+                state.db.set_setting(KEY_SETTING, &key)?;
+            }
+        }
     }
-    if let Some(b) = base_url.filter(|b| !b.trim().is_empty()) {
-        state.db.set_setting("base_url", b.trim())?;
+    if let Some(m) = model {
+        state.db.set_setting("model", &m)?;
     }
-    Ok(get_settings(state))
+    if let Some(b) = base_url {
+        state.db.set_setting("base_url", &b)?;
+    }
+    Ok(state.settings_json())
+}
+
+/// Remove a chave da API do cofre do sistema e do arquivo.
+#[tauri::command]
+fn clear_api_key(state: State<'_, AppState>) -> Result<Value, String> {
+    if let Err(why) = state.vault.delete() {
+        eprintln!("cofre: não foi possível remover a chave: {why}");
+    }
+    state.db.delete_setting(KEY_SETTING)?;
+    Ok(state.settings_json())
+}
+
+// ---------------------------------------------------------------- rede
+
+enum SendError {
+    Cancelled,
+    Failed(String),
+}
+
+struct Outgoing {
+    url: String,
+    key: String,
+    payload: Vec<u8>,
+    /// Quanto esperar pelo início da resposta.
+    header_timeout: Duration,
+    /// Teto do pedido inteiro, incluindo o corpo (só para respostas sem stream).
+    total_timeout: Option<Duration>,
+}
+
+fn net_kind(e: &reqwest::Error) -> NetErrorKind {
+    if e.is_timeout() {
+        NetErrorKind::Timeout
+    } else if e.is_connect() {
+        NetErrorKind::Connect
+    } else if e.is_body() || e.is_decode() {
+        NetErrorKind::Body
+    } else {
+        NetErrorKind::Other
+    }
+}
+
+fn net_message(e: reqwest::Error) -> String {
+    let kind = net_kind(&e);
+    net::net_error_message(kind, &e.without_url().to_string())
+}
+
+/// Espera `d`, acordando a cada 100 ms para ver o cancelamento. `true` se cancelou.
+async fn sleep_or_cancel(d: Duration, cancel: Option<&AtomicBool>) -> bool {
+    let deadline = Instant::now() + d;
+    loop {
+        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+async fn wait_cancelled(cancel: Option<&AtomicBool>) {
+    match cancel {
+        Some(flag) => {
+            while !flag.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// POST com nova tentativa em 429/5xx e falha de conexão (backoff exponencial,
+/// respeitando Retry-After), cancelável. Erros definitivos voltam já em português.
+async fn post_with_retry(
+    http: &reqwest::Client,
+    out: &Outgoing,
+    cancel: Option<&AtomicBool>,
+    mut on_retry: impl FnMut(&str),
+) -> Result<reqwest::Response, SendError> {
+    let mut attempt = 0;
+    loop {
+        let mut request = http
+            .post(&out.url)
+            .bearer_auth(&out.key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(out.payload.clone());
+        if let Some(total) = out.total_timeout {
+            request = request.timeout(total);
+        }
+        let sent = tokio::select! {
+            r = tokio::time::timeout(out.header_timeout, request.send()) => r,
+            _ = wait_cancelled(cancel) => return Err(SendError::Cancelled),
+        };
+        let (retry_after, reason) = match sent {
+            Ok(Ok(resp)) if resp.status().is_success() => return Ok(resp),
+            Ok(Ok(resp)) => {
+                let status = resp.status().as_u16();
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if !net::is_retryable_status(status) || attempt >= net::MAX_RETRIES {
+                    let body = resp.text().await.unwrap_or_default();
+                    eprintln!("DeepSeek HTTP {status}: {}", ai::truncate_chars(&body, 400));
+                    return Err(SendError::Failed(net::friendly_http_error(status, &body)));
+                }
+                (retry_after, format!("A DeepSeek respondeu {status}"))
+            }
+            Ok(Err(e)) => {
+                if net_kind(&e) != NetErrorKind::Connect || attempt >= net::MAX_RETRIES {
+                    return Err(SendError::Failed(net_message(e)));
+                }
+                (None, "Sem conexão com a DeepSeek".to_string())
+            }
+            Err(_elapsed) => {
+                return Err(SendError::Failed(net::net_error_message(NetErrorKind::Timeout, "")));
+            }
+        };
+        let wait = net::retry_delay(attempt, retry_after.as_deref());
+        on_retry(&format!(
+            "{reason}. Nova tentativa em {} s ({}/{})…",
+            wait.as_secs(),
+            attempt + 1,
+            net::MAX_RETRIES
+        ));
+        if sleep_or_cancel(wait, cancel).await {
+            return Err(SendError::Cancelled);
+        }
+        attempt += 1;
+    }
 }
 
 // ---------------------------------------------------------- fichamento
@@ -184,18 +393,27 @@ fn get_columns(state: State<'_, AppState>) -> Result<Vec<Column>, String> {
 
 #[tauri::command]
 fn save_columns(state: State<'_, AppState>, columns: Vec<Column>) -> Result<Vec<Column>, String> {
+    let mut seen = std::collections::HashSet::new();
     let prepared: Vec<Column> = columns
         .into_iter()
         .enumerate()
-        .map(|(i, c)| Column {
-            id: if c.id.trim().is_empty() { short_id() } else { c.id },
-            name: if c.name.trim().is_empty() {
-                format!("Coluna {}", i + 1)
-            } else {
-                c.name.trim().to_string()
-            },
-            instruction: c.instruction.trim().to_string(),
-            kind: if c.kind.trim().is_empty() { "text".into() } else { c.kind },
+        .map(|(i, c)| {
+            // Id vazio ou repetido receberia erro de chave primária no banco.
+            let mut id = c.id.trim().to_string();
+            if id.is_empty() || !seen.insert(id.clone()) {
+                id = short_id();
+                seen.insert(id.clone());
+            }
+            Column {
+                id,
+                name: if c.name.trim().is_empty() {
+                    format!("Coluna {}", i + 1)
+                } else {
+                    c.name.trim().to_string()
+                },
+                instruction: c.instruction.trim().to_string(),
+                kind: if c.kind.trim().is_empty() { "text".into() } else { c.kind },
+            }
         })
         .collect();
     state.db.replace_columns(&prepared)
@@ -252,124 +470,88 @@ async fn extract(
     if cols.is_empty() {
         return Err("Defina ao menos uma coluna.".into());
     }
+    let cfg = state.ai_config()?;
     let ctx = [DocContext {
         label: "D1".to_string(),
         doc: &doc,
         pages: &pages,
     }];
-    let context = format!("ID do documento: {}\n{}", doc.id, ai::build_context(&ctx, ""));
-    let body = ai::extract_body(&model_name(&state), &context, &cols);
-    let key = api_key(&state)?;
-    let url = format!("{}/chat/completions", base_url(&state).trim_end_matches('/'));
+    let context = format!("ID do documento: {}\n{}", doc.id, ai::build_extract_context(&ctx).text);
+    let body = ai::extract_body(&cfg.model, &context, &cols);
+    let out = Outgoing {
+        url: format!("{}/chat/completions", cfg.base_url),
+        key: cfg.key,
+        payload: serde_json::to_vec(&body).map_err(|e| e.to_string())?,
+        header_timeout: EXTRACT_TIMEOUT,
+        total_timeout: Some(EXTRACT_TIMEOUT),
+    };
 
-    let resp = state
-        .http
-        .post(url)
-        .bearer_auth(key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Falha na DeepSeek: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        eprintln!("extract: DeepSeek HTTP {status}: {text}");
-        return Err(format!("DeepSeek HTTP {status}: {text}"));
-    }
-    let payload: Value = resp.json().await.map_err(|e| e.to_string())?;
-    let raw = payload["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or_default();
-    eprintln!("extract: resposta bruta ({} chars): {}", raw.len(), &raw.chars().take(400).collect::<String>());
-    let raw_cells = ai::parse_cells(raw).map_err(|e| {
-        eprintln!("extract: JSON inválido: {e}");
-        e
-    })?;
-
-    for item in raw_cells {
-        let Some(column_id) = item.column_id else { continue };
-        if !cols.iter().any(|c| c.id == column_id) {
-            continue;
+    // Duas tentativas: o modelo às vezes devolve JSON quebrado na primeira.
+    let mut raw_cells = None;
+    let mut last_error = String::new();
+    for _ in 0..2 {
+        let resp = post_with_retry(&state.http, &out, None, |_| {})
+            .await
+            .map_err(|e| match e {
+                SendError::Failed(m) => m,
+                SendError::Cancelled => "Operação cancelada.".to_string(),
+            })?;
+        let payload: Value = resp.json().await.map_err(net_message)?;
+        if let Some(msg) = payload["error"]["message"].as_str() {
+            return Err(format!("A DeepSeek devolveu um erro: {msg}"));
         }
-        let (quote, page) = ai::verify_quote(item.quote, item.page, &pages);
-        let value = item
-            .value
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .filter(|_| quote.is_some());
-        let status = if value.is_some() { "filled" } else { "not_found" };
-        let evidence_ids = match (quote.as_deref(), page) {
-            (Some(q), Some(n)) => pages
-                .iter()
-                .find(|p| p.n == n)
-                .and_then(|p| evidence::resolve(&doc_id, n, q, &p.lines))
-                .map(|found| {
-                    let _ = state.db.save_evidence(&found);
-                    vec![found.id]
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        state.db.put_cell(
-            &doc_id,
-            &column_id,
-            value.as_deref(),
-            quote.as_deref(),
-            page,
-            status,
-            &evidence_ids,
-        )?;
-    }
-    for c in cols {
-        if !state.db.cells(Some(&doc_id))?.iter().any(|x| x.column_id == c.id) {
-            state
-                .db
-                .put_cell(&doc_id, &c.id, None, None, None, "not_found", &[])?;
+        let choice = &payload["choices"][0];
+        let raw = choice["message"]["content"].as_str().unwrap_or_default();
+        let truncated = choice["finish_reason"].as_str() == Some("length");
+        eprintln!("extract: resposta de {} caracteres (finish_reason={})", raw.chars().count(), choice["finish_reason"]);
+        match ai::parse_cells(raw) {
+            Ok(cells) => {
+                raw_cells = Some(cells);
+                break;
+            }
+            Err(_) if truncated => {
+                return Err("A resposta do modelo foi cortada por tamanho. Extraia menos colunas por vez.".into());
+            }
+            Err(e) => last_error = e,
         }
     }
+    let raw_cells = raw_cells.ok_or(last_error)?;
+    fichamento::apply_cells(&state.db, &doc_id, &pages, &cols, raw_cells)?;
     state.db.cells(Some(&doc_id))
 }
 
-fn csv_escape(value: &str) -> String {
-    if value.contains([',', '"', '\n']) {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
+#[tauri::command]
+fn write_csv(state: State<'_, AppState>, path: String, delimiter: Option<String>) -> Result<(), String> {
+    let delim = export::parse_delimiter(delimiter.as_deref())?;
+    let csv = export::csv_string(&state.db.list_docs()?, &state.db.columns()?, &state.db.cells(None)?, delim);
+    files::write_text_file(&path, &csv)
 }
 
+/// Grava um texto UTF-8 (Markdown, TXT ou CSV) no caminho escolhido no diálogo "salvar".
 #[tauri::command]
-fn write_csv(state: State<'_, AppState>, path: String) -> Result<(), String> {
-    let docs = state.db.list_docs()?;
-    let cols = state.db.columns()?;
-    let cells = state.db.cells(None)?;
-    let mut out = String::new();
-    out.push_str("Documento");
-    for c in &cols {
-        out.push(',');
-        out.push_str(&csv_escape(&c.name));
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    files::write_text_file(&path, &contents)
+}
+
+// -------------------------------------------------------------- anotações
+
+#[tauri::command]
+fn list_annotations(state: State<'_, AppState>, doc_id: String) -> Result<Vec<model::Annotation>, String> {
+    state.db.list_annotations(&doc_id)
+}
+
+/// Substitui a lista de anotações do documento (o frontend manda a lista inteira).
+#[tauri::command]
+fn save_annotations(
+    state: State<'_, AppState>,
+    doc_id: String,
+    annotations: Vec<model::Annotation>,
+) -> Result<(), String> {
+    if state.db.get_doc(&doc_id)?.is_none() {
+        return Err("Documento não encontrado.".into());
     }
-    out.push_str(",Trechos\n");
-    for d in docs {
-        out.push_str(&csv_escape(&d.name));
-        let mut quotes = Vec::new();
-        for c in &cols {
-            let cell = cells
-                .iter()
-                .find(|x| x.doc_id == d.id && x.column_id == c.id);
-            out.push(',');
-            if let Some(cell) = cell {
-                out.push_str(&csv_escape(cell.value.as_deref().unwrap_or("")));
-                if let (Some(q), Some(p)) = (&cell.quote, cell.page) {
-                    quotes.push(format!("[p.{p}] {q}"));
-                }
-            }
-        }
-        out.push(',');
-        out.push_str(&csv_escape(&quotes.join(" | ")));
-        out.push('\n');
-    }
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    model::validate_annotations(&annotations)?;
+    state.db.save_annotations(&doc_id, &annotations)
 }
 
 // -------------------------------------------------------------- evidências
@@ -402,201 +584,188 @@ fn get_evidence(state: State<'_, AppState>, id: String) -> Result<Option<Evidenc
 
 // ------------------------------------------------------------------ chat
 
-fn wants_visual(question: &str) -> bool {
-    let q = question.to_lowercase();
-    [
-        "figura", "figuras", "imagem", "imagens", "gráfico", "grafico", "tabela", "tabelas",
-        "diagrama", "quadro", "esquema", "chart", "figure", "table", "plot",
-    ]
-    .iter()
-    .any(|word| q.contains(word))
-}
+const TRUNCATED_NOTICE: &str = "\n\n*(Resposta interrompida pelo limite de tamanho do modelo.)*";
 
-/// Recortes de figuras que valem a pena mandar junto com a pergunta.
-fn figures_for_question(
-    question: &str,
-    docs: &[(Doc, Vec<Page>)],
-    labels: &[String],
-) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if !wants_visual(question) {
-        return out;
-    }
-    let q = ai::terms(question);
-    let mut ranked: Vec<(usize, usize, i64, String)> = Vec::new();
-    for (i, (_doc, pages)) in docs.iter().enumerate() {
-        for p in pages {
-            let score = ai::terms(&p.md).intersection(&q).count();
-            for f in &p.figures {
-                ranked.push((score, i, p.n, f.path.clone()));
-            }
+/// Aplica ao texto da resposta o que veio do stream, emitindo cada token.
+fn apply_stream_items(
+    app: &AppHandle,
+    id: &str,
+    items: Vec<net::SseItem>,
+    answer: &mut String,
+    finish_reason: &mut Option<String>,
+    error: &mut Option<String>,
+) {
+    for item in items {
+        let net::SseItem::Data(data) = item else { continue };
+        let delta = net::parse_stream_payload(&data);
+        if let Some(e) = delta.error {
+            *error = Some(format!("A DeepSeek interrompeu a resposta: {e}"));
+        }
+        if let Some(token) = delta.token {
+            answer.push_str(&token);
+            emit_ai(app, json!({"id": id, "type": "token", "t": token}));
+        }
+        if delta.finish_reason.is_some() {
+            *finish_reason = delta.finish_reason;
         }
     }
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
-    for (_, i, page_n, path) in ranked.into_iter().take(4) {
-        let Ok(bytes) = std::fs::read(&path) else { continue };
-        if bytes.len() > 4_000_000 {
-            continue;
-        }
-        let url = format!(
-            "data:image/png;base64,{}",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        );
-        let label = labels.get(i).cloned().unwrap_or_default();
-        out.push((
-            format!("Imagem {} — {} p.{}", out.len() + 1, label, page_n),
-            url,
-        ));
-    }
-    out
 }
 
 #[tauri::command]
-async fn chat(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    req: ChatRequest,
-) -> Result<(), String> {
+async fn chat(app: AppHandle, state: State<'_, AppState>, req: ChatRequest) -> Result<(), String> {
     let id = req.request_id.clone();
+    let cancel = state.cancel.token(&id);
+    // Falhas viram evento "error" (o frontend espera por ele); o comando em si não falha.
+    if let Err(message) = run_chat(&app, &state, &req, &cancel).await {
+        emit_ai(&app, json!({"id": id, "type": "error", "message": message}));
+    }
+    state.cancel.release(&id);
+    Ok(())
+}
+
+async fn run_chat(
+    app: &AppHandle,
+    state: &AppState,
+    req: &ChatRequest,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    let id = req.request_id.as_str();
+    // O rótulo é a posição na lista que o frontend enviou (D1 = doc_ids[0]), mesmo
+    // que algum documento não esteja pronto: o frontend resolve [D2 p.3] por esse índice.
     let mut docs: Vec<(Doc, Vec<Page>)> = Vec::new();
-    for doc_id in &req.doc_ids {
+    let mut labels: Vec<String> = Vec::new();
+    for (index, doc_id) in req.doc_ids.iter().enumerate() {
         if let Some(doc) = state.db.get_doc(doc_id)? {
             let pages = state.db.pages(doc_id)?;
             if !pages.is_empty() {
+                labels.push(format!("D{}", index + 1));
                 docs.push((doc, pages));
             }
         }
     }
     if docs.is_empty() || req.history.is_empty() {
-        let _ = app.emit(
-            "ai",
-            json!({"id": id, "type": "error", "message": "Nenhum documento pronto para consulta."}),
-        );
-        return Ok(());
+        return Err("Nenhum documento pronto para consulta.".into());
     }
-    let labels: Vec<String> = (1..=docs.len()).map(|i| format!("D{i}")).collect();
+    let cfg = state.ai_config()?;
+
     let ctx: Vec<DocContext> = docs
         .iter()
-        .enumerate()
-        .map(|(i, (doc, pages))| DocContext {
-            label: labels[i].clone(),
+        .zip(&labels)
+        .map(|((doc, pages), label)| DocContext {
+            label: label.clone(),
             doc,
             pages,
         })
         .collect();
     let question = req.history.last().map(|m| m.content.as_str()).unwrap_or("");
-    let context = ai::build_context(&ctx, question);
-    let images = figures_for_question(question, &docs, &labels);
-    let figure_count: usize = docs
-        .iter()
-        .flat_map(|(_, pages)| pages.iter())
-        .map(|p| p.figures.len())
-        .sum();
-    eprintln!(
-        "chat: {} recorte(s) anexado(s); visual={}; {figure_count} figura(s) nas páginas",
-        images.len(),
-        wants_visual(question)
-    );
-    let body = ai::chat_body(
-        &model_name(&state),
-        &context,
-        &req.history,
-        req.selection.as_deref(),
-        &images,
-    );
-    let key = match api_key(&state) {
-        Ok(k) => k,
-        Err(e) => {
-            let _ = app.emit("ai", json!({"id": id, "type": "error", "message": e}));
-            return Ok(());
-        }
+    let built = ai::build_context(&ctx, question);
+    let images = ai::figures_for_question(question, &docs, &labels);
+    eprintln!("chat: {} recorte(s) anexado(s); visual={}", images.len(), ai::wants_visual(question));
+    let body = ai::chat_body(&cfg.model, &built.text, &req.history, req.selection.as_deref(), &images);
+    let out = Outgoing {
+        url: format!("{}/chat/completions", cfg.base_url),
+        key: cfg.key,
+        payload: serde_json::to_vec(&body).map_err(|e| e.to_string())?,
+        header_timeout: CHAT_HEADER_TIMEOUT,
+        total_timeout: None,
     };
-    let url = format!("{}/chat/completions", base_url(&state).trim_end_matches('/'));
-    let resp = match state.http.post(url).bearer_auth(key).json(&body).send().await {
+
+    let sent = post_with_retry(&state.http, &out, Some(cancel), |message| {
+        emit_ai(app, json!({"id": id, "type": "status", "message": message}));
+    })
+    .await;
+    let resp = match sent {
         Ok(r) => r,
-        Err(e) => {
-            let _ = app.emit(
-                "ai",
-                json!({"id": id, "type": "error", "message": format!("Falha na DeepSeek: {e}")}),
+        Err(SendError::Failed(message)) => return Err(message),
+        Err(SendError::Cancelled) => {
+            emit_ai(
+                app,
+                json!({"id": id, "type": "done", "answer": "", "labels": labels,
+                       "citations": [], "cancelled": true, "truncated": false}),
             );
             return Ok(());
         }
     };
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        let _ = app.emit(
-            "ai",
-            json!({"id": id, "type": "error", "message": format!("DeepSeek HTTP {status}: {text}")}),
-        );
-        return Ok(());
-    }
 
     let mut stream = resp.bytes_stream();
-    let mut buf = String::new();
+    let mut parser = net::SseParser::new();
     let mut answer = String::new();
-    while let Some(chunk) = stream.next().await {
-        if state
-            .cancelled
-            .lock()
-            .map(|c| c.contains(&id))
-            .unwrap_or(false)
-        {
+    let mut finish_reason: Option<String> = None;
+    let mut stream_error: Option<String> = None;
+    let mut cancelled = false;
+    let mut last_activity = Instant::now();
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
             break;
         }
+        // Acorda a cada 250 ms para ver o cancelamento mesmo com o servidor mudo.
+        let next = tokio::time::timeout(Duration::from_millis(250), stream.next()).await;
+        let chunk = match next {
+            Err(_) => {
+                if last_activity.elapsed() > Duration::from_secs(net::STREAM_IDLE_SECS) {
+                    stream_error = Some("A DeepSeek parou de responder. Tente de novo.".to_string());
+                    break;
+                }
+                continue;
+            }
+            Ok(None) => break,
+            Ok(Some(chunk)) => chunk,
+        };
+        last_activity = Instant::now();
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
-                let _ = app.emit(
-                    "ai",
-                    json!({"id": id, "type": "error", "message": format!("Conexão interrompida: {e}")}),
-                );
+                stream_error = Some(if e.is_timeout() {
+                    net_message(e)
+                } else {
+                    net::net_error_message(NetErrorKind::Body, "")
+                });
                 break;
             }
         };
-        buf.push_str(&String::from_utf8_lossy(&bytes));
-        loop {
-            let separator = buf
-                .find("\n\n")
-                .map(|p| (p, 2))
-                .or_else(|| buf.find("\r\n\r\n").map(|p| (p, 4)));
-            let Some((pos, len)) = separator else { break };
-            let event: String = buf.drain(..pos + len).collect();
-            for line in event.lines() {
-                let Some(data) = line.strip_prefix("data:") else { continue };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                if let Ok(value) = serde_json::from_str::<Value>(data) {
-                    if let Some(token) = value["choices"][0]["delta"]["content"].as_str() {
-                        if !token.is_empty() {
-                            answer.push_str(token);
-                            let _ = app.emit(
-                                "ai",
-                                json!({"id": id, "type": "token", "t": token}),
-                            );
-                        }
-                    }
-                }
+        match parser.feed(&bytes) {
+            Ok(items) => apply_stream_items(app, id, items, &mut answer, &mut finish_reason, &mut stream_error),
+            Err(e) => {
+                stream_error = Some(e);
+                break;
             }
         }
+        if stream_error.is_some() {
+            break;
+        }
     }
-    let _ = app.emit(
-        "ai",
-        json!({"id": id, "type": "done", "answer": answer, "labels": labels}),
+    if !cancelled && stream_error.is_none() {
+        let rest = parser.finish();
+        apply_stream_items(app, id, rest, &mut answer, &mut finish_reason, &mut stream_error);
+    }
+    if let Some(e) = stream_error {
+        return Err(e);
+    }
+    if answer.trim().is_empty() && !cancelled {
+        // 200 com corpo que não é SSE (ex.: JSON de erro): mostra o que o provedor disse.
+        return Err(match net::provider_message(parser.stray()) {
+            Some(m) => format!("A DeepSeek respondeu sem texto: {m}"),
+            None => "A DeepSeek não devolveu texto. Tente de novo.".to_string(),
+        });
+    }
+    let truncated = finish_reason.as_deref() == Some("length");
+    if truncated {
+        answer.push_str(TRUNCATED_NOTICE);
+        emit_ai(app, json!({"id": id, "type": "token", "t": TRUNCATED_NOTICE}));
+    }
+    let citations = ai::check_citations(&answer, &built.sent_pages);
+    emit_ai(
+        app,
+        json!({"id": id, "type": "done", "answer": answer, "labels": labels,
+               "citations": citations, "cancelled": cancelled, "truncated": truncated}),
     );
-    if let Ok(mut c) = state.cancelled.lock() {
-        c.remove(&id);
-    }
     Ok(())
 }
 
 #[tauri::command]
 fn cancel_chat(state: State<'_, AppState>, request_id: String) {
-    if let Ok(mut c) = state.cancelled.lock() {
-        c.insert(request_id);
-    }
+    state.cancel.cancel(&request_id);
 }
 
 // ------------------------------------------------------------------- run
@@ -604,18 +773,41 @@ fn cancel_chat(state: State<'_, AppState>, request_id: String) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
+            let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(dir.join("uploads"))?;
-            let db = Db::open(&dir.join("pdfchat.sqlite3")).map_err(|e| e.to_string())?;
+            let db = Db::open(&dir.join("pdfchat.sqlite3"))?;
+            let vault = keystore::system_store();
+
+            // Migração automática: a chave que versões antigas guardavam em texto
+            // puro no SQLite vai para o Keychain/Credential Manager. Só apaga a
+            // cópia antiga depois de conferir a leitura; se o cofre falhar, ela fica.
+            match secrets::migrate_legacy(&*vault, db.setting(KEY_SETTING).as_deref()) {
+                secrets::Migration::Migrated => {
+                    if let Err(e) = db.delete_setting(KEY_SETTING) {
+                        eprintln!("cofre: chave migrada, mas a cópia antiga não foi removida: {e}");
+                    }
+                }
+                secrets::Migration::KeptInFile(why) => {
+                    eprintln!("cofre: mantendo a chave no arquivo ({why})");
+                }
+                secrets::Migration::NothingToDo => {}
+            }
+
             let http = reqwest::Client::builder()
-                .timeout(Duration::from_secs(300))
+                .connect_timeout(Duration::from_secs(15))
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                // Conexões ociosas morrem quando o notebook dorme: não reaproveitar por muito tempo.
+                .pool_idle_timeout(Duration::from_secs(30))
+                .user_agent(concat!("Margem/", env!("CARGO_PKG_VERSION")))
                 .build()
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Não foi possível iniciar o cliente de rede: {e}"))?;
             app.manage(AppState {
                 db,
                 http,
-                cancelled: Mutex::new(HashSet::new()),
+                cancel: CancelRegistry::new(),
+                vault,
             });
             Ok(())
         })
@@ -630,66 +822,19 @@ pub fn run() {
             get_evidence,
             get_settings,
             save_settings,
+            clear_api_key,
             get_columns,
             save_columns,
             get_cells,
             update_cell,
             extract,
             write_csv,
+            write_text_file,
+            list_annotations,
+            save_annotations,
             chat,
             cancel_chat
         ])
         .run(tauri::generate_context!())
-        .expect("erro ao iniciar o PDF Chat");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use model::{Block, Figure};
-
-    fn doc() -> Doc {
-        Doc {
-            id: "d1".into(),
-            name: "artigo".into(),
-            page_count: 1,
-            path: "/tmp/artigo.pdf".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-        }
-    }
-
-    #[test]
-    fn pergunta_visual_anexa_recorte_da_figura() {
-        let path = std::env::temp_dir().join("figura-teste.png");
-        std::fs::write(&path, [0x89u8, b'P', b'N', b'G']).unwrap();
-        let page = Page {
-            n: 3,
-            md: "gráfico de inscritos por estado".into(),
-            text: "gráfico de inscritos por estado".into(),
-            blocks: vec![Block {
-                text: "gráfico de inscritos por estado".into(),
-                x: 0.0,
-                y: 0.0,
-                w: 10.0,
-                h: 10.0,
-                size: 11.0,
-            }],
-            lines: vec![],
-            figures: vec![Figure {
-                index: 0,
-                path: path.to_string_lossy().to_string(),
-                w: 100.0,
-                h: 50.0,
-            }],
-        };
-        let docs = vec![(doc(), vec![page])];
-        let labels = vec!["D1".to_string()];
-
-        let imagens = figures_for_question("o que mostra a figura 2?", &docs, &labels);
-        assert_eq!(imagens.len(), 1);
-        assert!(imagens[0].1.starts_with("data:image/png;base64,"));
-        assert!(imagens[0].0.contains("p.3"));
-
-        assert!(figures_for_question("qual a metodologia?", &docs, &labels).is_empty());
-    }
+        .expect("erro ao iniciar o Margem");
 }

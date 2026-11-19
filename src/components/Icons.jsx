@@ -64,4 +64,74 @@ export const Icon = {
       <path d="M9 7H5v5h4c0 3-1 5-4 6M19 7h-4v5h4c0 3-1 5-4 6" />
     </svg>
   ),
+  chevronUp: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m6 15 6-6 6 6" />
+    </svg>
+  ),
+  chevronDown: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  ),
+  chevronLeft: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m15 6-6 6 6 6" />
+    </svg>
+  ),
+  chevronRight: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m9 6 6 6-6 6" />
+    </svg>
+  ),
+  copy: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V6a2 2 0 0 1 2-2h8" />
+    </svg>
+  ),
+  download: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M12 4v11M7 11l5 5 5-5M5 20h14" />
+    </svg>
+  ),
+  note: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M5 4h14v12l-5 5H5V4Z" />
+      <path d="M14 21v-5h5M8 9h8M8 13h5" />
+    </svg>
+  ),
+  highlighter: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m14 5 5 5-8 8H6v-5l8-8Z" />
+      <path d="M4 21h8" />
+    </svg>
+  ),
+  menu: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M4 7h16M4 12h16M4 17h16" />
+    </svg>
+  ),
+  panel: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M15 4v16" />
+    </svg>
+  ),
+  keyboard: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <rect x="2.5" y="6" width="19" height="12" rx="2" />
+      <path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10" />
+    </svg>
+  ),
+  check: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="m5 12 5 5 9-10" />
+    </svg>
+  ),
+  external: (p) => (
+    <svg viewBox="0 0 24 24" {...p}>
+      <path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5" />
+    </svg>
+  ),
 }

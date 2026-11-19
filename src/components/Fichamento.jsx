@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Icon } from './Icons'
 
 const SUGGESTED = [
@@ -20,6 +20,7 @@ export function Fichamento({
   onExport,
   busy,
 }) {
+  const exportMenu = useRef(null)
   const [draft, setDraft] = useState(columns)
   const [dirty, setDirty] = useState(false)
 
@@ -43,9 +44,27 @@ export function Fichamento({
     setDirty(true)
   }
 
+  // Acrescenta só as sugeridas que ainda não existem (não apaga o que foi escrito).
   function useSuggested() {
-    setDraft(SUGGESTED.map((item) => ({ ...item, id: '', type: 'text' })))
+    setDraft((prev) => {
+      const have = new Set(prev.map((c) => c.name.trim().toLowerCase()))
+      const extra = SUGGESTED.filter((item) => !have.has(item.name.toLowerCase())).map((item) => ({
+        ...item,
+        id: '',
+        type: 'text',
+      }))
+      return [...prev.filter((c) => c.name.trim() || c.instruction.trim()), ...extra]
+    })
     setDirty(true)
+  }
+
+  // Coluna editada e não salva: salva antes de extrair, senão a IA usa as antigas.
+  async function guarded(action) {
+    if (dirty) {
+      const ok = await onSaveColumns(draft)
+      if (ok === false) return
+    }
+    action()
   }
 
   const ready = docs.filter((doc) => doc.page_count > 0)
@@ -64,10 +83,38 @@ export function Fichamento({
           <button className="btn ghost" onClick={useSuggested}>
             Colunas sugeridas
           </button>
-          <button className="btn ghost" onClick={onExport} disabled={!columns.length}>
-            Exportar CSV
-          </button>
-          <button className="btn primary" onClick={onExtractAll} disabled={!columns.length || !!busy}>
+          <details className="menu" ref={exportMenu}>
+            <summary className={`btn ghost ${!columns.length ? 'disabled' : ''}`} aria-disabled={!columns.length}>
+              {Icon.download({ className: 'ico' })} Exportar CSV
+            </summary>
+            <div className="menu-list">
+              <button
+                disabled={!columns.length}
+                onClick={() => {
+                  exportMenu.current?.removeAttribute('open')
+                  onExport('comma')
+                }}
+              >
+                UTF-8 com vírgula
+                <small>Google Planilhas, Numbers, Python/R</small>
+              </button>
+              <button
+                disabled={!columns.length}
+                onClick={() => {
+                  exportMenu.current?.removeAttribute('open')
+                  onExport('semicolon')
+                }}
+              >
+                Excel em português (;)
+                <small>abre direto com acentos e colunas</small>
+              </button>
+            </div>
+          </details>
+          <button
+            className="btn primary"
+            onClick={() => guarded(onExtractAll)}
+            disabled={!draft.some((c) => c.name.trim()) || !!busy}
+          >
             Extrair todos
           </button>
         </div>
@@ -82,17 +129,19 @@ export function Fichamento({
             <div className="column-row" key={index}>
               <input
                 className="col-name"
+                aria-label={`Nome da coluna ${index + 1}`}
                 placeholder="Nome da coluna"
                 value={column.name}
                 onChange={(event) => update(index, 'name', event.target.value)}
               />
               <input
                 className="col-instruction"
+                aria-label={`Instrução da coluna ${index + 1}`}
                 placeholder="O que deve ser extraído (instrução para a IA)"
                 value={column.instruction}
                 onChange={(event) => update(index, 'instruction', event.target.value)}
               />
-              <button className="icon-btn" title="Remover coluna" onClick={() => remove(index)}>
+              <button className="icon-btn" title="Remover coluna" aria-label={`Remover coluna ${index + 1}`} onClick={() => remove(index)}>
                 {Icon.trash({ className: 'ico' })}
               </button>
             </div>
@@ -120,11 +169,12 @@ export function Fichamento({
       ) : (
         <div className="table-scroll">
           <table className="fichamento">
+            <caption className="sr-only">Fichamento: uma linha por documento, uma coluna por pergunta</caption>
             <thead>
               <tr>
-                <th className="sticky">Documento</th>
+                <th className="sticky" scope="col">Documento</th>
                 {columns.map((column) => (
-                  <th key={column.id} title={column.instruction}>
+                  <th key={column.id} scope="col" title={column.instruction}>
                     {column.name}
                   </th>
                 ))}
@@ -135,7 +185,7 @@ export function Fichamento({
                 const extracting = busy?.docId === doc.id
                 return (
                   <tr key={doc.id}>
-                    <td className="sticky doc-cell">
+                    <th className="sticky doc-cell" scope="row">
                       <span className="doc-cell-name" title={doc.name}>
                         {doc.name}
                       </span>
@@ -143,11 +193,11 @@ export function Fichamento({
                       <button
                         className="btn tiny row-extract"
                         disabled={!!busy}
-                        onClick={() => onExtract(doc)}
+                        onClick={() => guarded(() => onExtract(doc))}
                       >
                         {extracting ? 'extraindo…' : 'Extrair'}
                       </button>
-                    </td>
+                    </th>
                     {columns.map((column) => {
                       const cell = cells.find(
                         (item) => item.doc_id === doc.id && item.column_id === column.id,

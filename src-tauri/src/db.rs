@@ -3,15 +3,46 @@ use std::sync::Mutex;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::model::{Cell, Column, Doc, Page};
+use crate::model::{Anchor, Annotation, Cell, Column, Doc, Page};
 
 pub struct Db {
     conn: Mutex<Connection>,
 }
 
+fn ensure_column(conn: &Connection, table: &str, column: &str, definition: &str) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|e| e.to_string())?;
+    let exists = stmt
+        .query_map([], |r| r.get::<_, String>(1))
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])
+            .map_err(|e| format!("Falha ao migrar o banco de dados ({table}.{column}): {e}"))?;
+    }
+    Ok(())
+}
+
 impl Db {
     pub fn open(path: &Path) -> Result<Self, String> {
-        let conn = Connection::open(path).map_err(|e| e.to_string())?;
+        let conn = Connection::open(path).map_err(|e| {
+            format!("Não foi possível abrir o banco de dados em {}: {e}", path.display())
+        })?;
+        Self::init(conn)
+    }
+
+    #[cfg(test)]
+    pub fn open_in_memory() -> Result<Self, String> {
+        Self::init(Connection::open_in_memory().map_err(|e| e.to_string())?)
+    }
+
+    fn init(conn: Connection) -> Result<Self, String> {
+        // Outra instância (ou o antivírus no Windows) pode segurar o arquivo por instantes.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
+        // journal_mode devolve uma linha; execute_batch descarta o resultado.
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA foreign_keys=ON;
@@ -59,25 +90,30 @@ impl Db {
                created_at TEXT NOT NULL
              );
              CREATE INDEX IF NOT EXISTS evidence_doc_page ON evidence(doc_id, page);
+             CREATE TABLE IF NOT EXISTS annotations(
+               doc_id TEXT NOT NULL,
+               id TEXT NOT NULL,
+               page INTEGER NOT NULL,
+               color TEXT NOT NULL,
+               text TEXT NOT NULL,
+               note TEXT NOT NULL DEFAULT '',
+               anchor TEXT NOT NULL DEFAULT '{}',
+               created_at TEXT NOT NULL DEFAULT '',
+               updated_at TEXT NOT NULL DEFAULT '',
+               position INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(doc_id, id)
+             );
              CREATE TABLE IF NOT EXISTS settings(
                key TEXT PRIMARY KEY,
                value TEXT NOT NULL
              );",
         )
-        .map_err(|e| e.to_string())?;
-        // Bancos criados antes das figuras: adiciona a coluna sem quebrar quem já tem.
-        let _ = conn.execute(
-            "ALTER TABLE pages ADD COLUMN figures TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE pages ADD COLUMN lines TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
-        let _ = conn.execute(
-            "ALTER TABLE cells ADD COLUMN evidence TEXT NOT NULL DEFAULT '[]'",
-            [],
-        );
+        .map_err(|e| format!("Falha ao preparar o banco de dados: {e}"))?;
+        // Bancos criados antes das figuras/linhas/evidências: adiciona a coluna sem
+        // quebrar quem já tem (e sem engolir erros que não sejam "coluna já existe").
+        ensure_column(&conn, "pages", "figures", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(&conn, "pages", "lines", "TEXT NOT NULL DEFAULT '[]'")?;
+        ensure_column(&conn, "cells", "evidence", "TEXT NOT NULL DEFAULT '[]'")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -152,8 +188,64 @@ impl Db {
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM evidence WHERE doc_id=?", params![id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM annotations WHERE doc_id=?", params![id])
+            .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM documents WHERE id=?", params![id])
             .map_err(|e| e.to_string())?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    // ---------------------------------------------------------- anotações
+
+    pub fn list_annotations(&self, doc_id: &str) -> Result<Vec<Annotation>, String> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id,page,color,text,note,anchor,created_at,updated_at FROM annotations
+                 WHERE doc_id=? ORDER BY position, created_at, id",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![doc_id], |r| {
+                let anchor: String = r.get(5)?;
+                Ok(Annotation {
+                    id: r.get(0)?,
+                    doc_id: doc_id.to_string(),
+                    page: r.get(1)?,
+                    color: r.get(2)?,
+                    text: r.get(3)?,
+                    note: r.get(4)?,
+                    anchor: serde_json::from_str::<Anchor>(&anchor).unwrap_or_default(),
+                    created_at: r.get(6)?,
+                    updated_at: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Substitui, numa transação, toda a lista de anotações do documento.
+    /// O `doc_id` do argumento manda: o campo `docId` de cada item é ignorado.
+    pub fn save_annotations(&self, doc_id: &str, list: &[Annotation]) -> Result<(), String> {
+        let mut conn = self.lock();
+        let tx = conn.transaction().map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM annotations WHERE doc_id=?", params![doc_id])
+            .map_err(|e| e.to_string())?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO annotations(doc_id,id,page,color,text,note,anchor,created_at,updated_at,position)
+                     VALUES(?,?,?,?,?,?,?,?,?,?)",
+                )
+                .map_err(|e| e.to_string())?;
+            for (i, a) in list.iter().enumerate() {
+                let anchor = serde_json::to_string(&a.anchor).map_err(|e| e.to_string())?;
+                stmt.execute(params![
+                    doc_id, a.id, a.page, a.color, a.text, a.note, anchor, a.created_at, a.updated_at, i as i64
+                ])
+                .map_err(|e| e.to_string())?;
+            }
+        }
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -172,7 +264,7 @@ impl Db {
             let lines = serde_json::to_string(&p.lines).map_err(|e| e.to_string())?;
             let figures = serde_json::to_string(&p.figures).map_err(|e| e.to_string())?;
             tx.execute(
-                "INSERT INTO pages(doc_id,n,md,text,blocks,lines,figures) VALUES(?,?,?,?,?,?,?)",
+                "INSERT OR REPLACE INTO pages(doc_id,n,md,text,blocks,lines,figures) VALUES(?,?,?,?,?,?,?)",
                 params![doc_id, p.n, p.md, p.text, blocks, lines, figures],
             )
             .map_err(|e| e.to_string())?;
@@ -229,17 +321,19 @@ impl Db {
     }
 
     pub fn replace_columns(&self, cols: &[Column]) -> Result<Vec<Column>, String> {
-        let mut conn = self.lock();
-        let tx = conn.transaction().map_err(|e| e.to_string())?;
-        tx.execute("DELETE FROM columns", []).map_err(|e| e.to_string())?;
-        for (i, c) in cols.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO columns(id,position,name,instruction,kind) VALUES(?,?,?,?,?)",
-                params![c.id, i as i64, c.name, c.instruction, c.kind],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        tx.commit().map_err(|e| e.to_string())?;
+        {
+            let mut conn = self.lock();
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            tx.execute("DELETE FROM columns", []).map_err(|e| e.to_string())?;
+            for (i, c) in cols.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO columns(id,position,name,instruction,kind) VALUES(?,?,?,?,?)",
+                    params![c.id, i as i64, c.name, c.instruction, c.kind],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        } // solta o cofre da conexão antes de `columns()` travar de novo (Mutex não é reentrante)
         self.columns()
     }
 
@@ -278,6 +372,7 @@ impl Db {
         Ok(out)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn put_cell(
         &self,
         doc_id: &str,
@@ -336,7 +431,6 @@ impl Db {
             .map_err(|e| e.to_string())
     }
 
-
     // ----------------------------------------------------------- configuração
 
     pub fn setting(&self, key: &str) -> Option<String> {
@@ -345,6 +439,13 @@ impl Db {
             .optional()
             .ok()
             .flatten()
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<(), String> {
+        self.lock()
+            .execute("DELETE FROM settings WHERE key=?", params![key])
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn set_setting(&self, key: &str, value: &str) -> Result<(), String> {
@@ -356,5 +457,309 @@ impl Db {
             )
             .map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Block, Evidence, Figure, Line};
+
+    fn db() -> Db {
+        Db::open_in_memory().unwrap()
+    }
+
+    fn page(n: i64, text: &str) -> Page {
+        Page {
+            n,
+            md: format!("## Página {n}\n\n{text}"),
+            text: text.to_string(),
+            blocks: vec![Block { text: text.into(), x: 72.0, y: 700.0, w: 400.0, h: 12.0, size: 11.0 }],
+            lines: vec![Line { i: 0, text: text.into(), rect: [72.0, 700.0, 472.0, 712.0] }],
+            figures: vec![Figure { index: 0, path: "C:\\Users\\João\\fig.png".into(), w: 1.0, h: 2.0 }],
+        }
+    }
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("margem-db-{tag}-{}-{}", std::process::id(), uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("pdfchat.sqlite3")
+    }
+
+    fn ann(id: &str, page: i64, text: &str) -> Annotation {
+        Annotation {
+            id: id.into(),
+            doc_id: "d1".into(),
+            page,
+            color: "yellow".into(),
+            text: text.into(),
+            note: "nota com ação".into(),
+            anchor: Anchor { text: text.into(), prefix: "antes ".into(), suffix: " depois".into(), offset: 42 },
+            created_at: "2026-01-01T00:00:00.000Z".into(),
+            updated_at: "2026-01-02T00:00:00.000Z".into(),
+        }
+    }
+
+    #[test]
+    fn anotacoes_ida_e_volta_substituem_e_mantem_ordem() {
+        let db = db();
+        assert!(db.list_annotations("d1").unwrap().is_empty());
+        let lista = vec![ann("b", 3, "segundo trecho — ç"), ann("a", 1, "primeiro")];
+        db.save_annotations("d1", &lista).unwrap();
+        assert_eq!(db.list_annotations("d1").unwrap(), lista);
+        db.save_annotations("d1", &lista[..1]).unwrap();
+        assert_eq!(db.list_annotations("d1").unwrap().len(), 1);
+        db.save_annotations("d1", &[]).unwrap();
+        assert!(db.list_annotations("d1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn anotacoes_sao_isoladas_por_documento_e_apagadas_com_ele() {
+        let db = db();
+        db.insert_doc("d1", "A", "/a.pdf", "2026-01-01T00:00:00Z").unwrap();
+        db.insert_doc("d2", "B", "/b.pdf", "2026-01-01T00:00:00Z").unwrap();
+        db.save_annotations("d1", &[ann("x", 1, "um")]).unwrap();
+        // mesmo id em outro documento não colide
+        db.save_annotations("d2", &[ann("x", 2, "dois")]).unwrap();
+        assert_eq!(db.list_annotations("d1").unwrap()[0].text, "um");
+        assert_eq!(db.list_annotations("d2").unwrap()[0].doc_id, "d2");
+        db.delete_doc("d1").unwrap();
+        assert!(db.list_annotations("d1").unwrap().is_empty());
+        assert_eq!(db.list_annotations("d2").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn banco_antigo_sem_tabela_de_anotacoes_e_migrado() {
+        let path = tmp_path("ann-migra");
+        {
+            // banco da versão 0.1: só as tabelas antigas, com dados
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE documents(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL,
+                   page_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+                 INSERT INTO documents VALUES('d1','Velho','/v.pdf',3,'2025-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.list_docs().unwrap().len(), 1);
+        db.save_annotations("d1", &[ann("a", 1, "novo")]).unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap(); // reabrir não perde nada
+        assert_eq!(db.list_annotations("d1").unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn documento_ida_e_volta_com_acentos() {
+        let db = db();
+        let d = db.insert_doc("d1", "Educação Estatística — Batanero (1999)", "/x/y.pdf", "2026-01-01T00:00:00Z").unwrap();
+        assert_eq!(d.page_count, 0);
+        assert_eq!(db.list_docs().unwrap().len(), 1);
+        assert_eq!(db.get_doc("d1").unwrap().unwrap().name, "Educação Estatística — Batanero (1999)");
+        assert!(db.get_doc("nao-existe").unwrap().is_none());
+        // id repetido: erro, não pânico
+        assert!(db.insert_doc("d1", "x", "p", "t").is_err());
+    }
+
+    #[test]
+    fn paginas_preservam_linhas_figuras_e_caminho_windows() {
+        let db = db();
+        db.insert_doc("d1", "a", "p", "t").unwrap();
+        db.save_pages("d1", &[page(1, "ação"), page(2, "segunda")]).unwrap();
+        let pages = db.pages("d1").unwrap();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0].lines[0].text, "ação");
+        assert_eq!(pages[0].figures[0].path, "C:\\Users\\João\\fig.png");
+        assert_eq!(db.get_doc("d1").unwrap().unwrap().page_count, 2);
+    }
+
+    #[test]
+    fn salvar_paginas_de_novo_substitui_e_limpa_evidencias() {
+        let db = db();
+        db.insert_doc("d1", "a", "p", "t").unwrap();
+        db.save_pages("d1", &[page(1, "um")]).unwrap();
+        let ev = Evidence { id: "d1:1:0-0".into(), doc_id: "d1".into(), page: 1, text: "um".into(), rects: vec![[0.0, 0.0, 1.0, 1.0]] };
+        db.save_evidence(&ev).unwrap();
+        db.put_cell("d1", "c1", Some("v"), Some("q q q"), Some(1), "filled", std::slice::from_ref(&ev.id)).unwrap();
+        db.save_pages("d1", &[page(1, "novo"), page(2, "dois")]).unwrap();
+        assert_eq!(db.pages("d1").unwrap().len(), 2);
+        assert!(db.get_evidence("d1:1:0-0").unwrap().is_none());
+        assert!(db.cells(Some("d1")).unwrap()[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn paginas_duplicadas_do_frontend_nao_derrubam_a_gravacao() {
+        let db = db();
+        db.insert_doc("d1", "a", "p", "t").unwrap();
+        db.save_pages("d1", &[page(1, "a"), page(1, "b")]).unwrap();
+        assert_eq!(db.pages("d1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn excluir_documento_apaga_tudo_dele_e_so_dele() {
+        let db = db();
+        for id in ["d1", "d2"] {
+            db.insert_doc(id, id, "p", "t").unwrap();
+            db.save_pages(id, &[page(1, "x")]).unwrap();
+            db.put_cell(id, "c1", Some("v"), None, None, "filled", &[]).unwrap();
+            db.save_evidence(&Evidence { id: format!("{id}:1:0-0"), doc_id: id.into(), page: 1, text: "x".into(), rects: vec![] }).unwrap();
+        }
+        db.delete_doc("d1").unwrap();
+        assert!(db.get_doc("d1").unwrap().is_none());
+        assert!(db.pages("d1").unwrap().is_empty());
+        assert!(db.cells(Some("d1")).unwrap().is_empty());
+        assert!(db.get_evidence("d1:1:0-0").unwrap().is_none());
+        assert_eq!(db.cells(None).unwrap().len(), 1);
+        assert!(db.get_evidence("d2:1:0-0").unwrap().is_some());
+        db.delete_doc("nao-existe").unwrap();
+    }
+
+    #[test]
+    fn colunas_substituem_e_mantem_ordem() {
+        let db = db();
+        let col = |id: &str, n: &str| Column { id: id.into(), name: n.into(), instruction: "i".into(), kind: "text".into() };
+        db.replace_columns(&[col("b", "Segunda"), col("a", "Primeira")]).unwrap();
+        let got = db.columns().unwrap();
+        assert_eq!(got.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["b", "a"]);
+        db.replace_columns(&[col("z", "Só")]).unwrap();
+        assert_eq!(db.columns().unwrap().len(), 1);
+        // id duplicado: erro, e a lista anterior continua valendo (transação)
+        assert!(db.replace_columns(&[col("x", "1"), col("x", "2")]).is_err());
+        assert_eq!(db.columns().unwrap()[0].id, "z");
+    }
+
+    #[test]
+    fn celulas_upsert_e_filtro_por_documento() {
+        let db = db();
+        db.put_cell("d1", "c1", Some("120"), Some("120 participantes"), Some(7), "filled", &["e1".into()]).unwrap();
+        db.put_cell("d1", "c1", Some("130"), None, None, "edited", &[]).unwrap();
+        db.put_cell("d2", "c1", None, None, None, "not_found", &[]).unwrap();
+        let d1 = db.cells(Some("d1")).unwrap();
+        assert_eq!(d1.len(), 1);
+        assert_eq!(d1[0].value.as_deref(), Some("130"));
+        assert_eq!(d1[0].status, "edited");
+        assert!(d1[0].quote.is_none() && d1[0].evidence.is_empty());
+        assert_eq!(db.cells(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn evidencia_upsert_mantem_id_estavel() {
+        let db = db();
+        let mut ev = Evidence { id: "d1:2:3-4".into(), doc_id: "d1".into(), page: 2, text: "antes".into(), rects: vec![[1.0, 2.0, 3.0, 4.0]] };
+        db.save_evidence(&ev).unwrap();
+        ev.text = "depois".into();
+        ev.rects.push([5.0, 6.0, 7.0, 8.0]);
+        db.save_evidence(&ev).unwrap();
+        let got = db.get_evidence("d1:2:3-4").unwrap().unwrap();
+        assert_eq!(got.text, "depois");
+        assert_eq!(got.rects.len(), 2);
+    }
+
+    #[test]
+    fn configuracoes_e_remocao() {
+        let db = db();
+        assert_eq!(db.setting("model"), None);
+        db.set_setting("model", "deepseek-flash").unwrap();
+        db.set_setting("model", "outro").unwrap();
+        assert_eq!(db.setting("model").as_deref(), Some("outro"));
+        db.delete_setting("model").unwrap();
+        assert_eq!(db.setting("model"), None);
+        db.delete_setting("model").unwrap();
+    }
+
+    #[test]
+    fn json_corrompido_no_banco_vira_vazio_sem_panico() {
+        let db = db();
+        db.insert_doc("d1", "a", "p", "t").unwrap();
+        db.lock()
+            .execute(
+                "INSERT INTO pages(doc_id,n,md,text,blocks,lines,figures) VALUES('d1',1,'m','t','{quebrado','nao json','[[')",
+                [],
+            )
+            .unwrap();
+        let pages = db.pages("d1").unwrap();
+        assert_eq!(pages.len(), 1);
+        assert!(pages[0].blocks.is_empty() && pages[0].lines.is_empty() && pages[0].figures.is_empty());
+    }
+
+    #[test]
+    fn banco_em_arquivo_persiste_e_reabre() {
+        let path = tmp_path("reabre");
+        {
+            let db = Db::open(&path).unwrap();
+            db.insert_doc("d1", "Tese — Celi & Batanero", "/x.pdf", "2026-01-01T00:00:00Z").unwrap();
+            db.set_setting("base_url", "https://api.deepseek.com").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.list_docs().unwrap()[0].name, "Tese — Celi & Batanero");
+        assert_eq!(db.setting("base_url").as_deref(), Some("https://api.deepseek.com"));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn caminho_com_espacos_e_acentos_abre() {
+        let base = tmp_path("acentos");
+        let dir = base.parent().unwrap().join("Gerlan Silva — pesquisa");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("pdfchat.sqlite3")).unwrap();
+        db.set_setting("k", "v").unwrap();
+        drop(db);
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
+    }
+
+    #[test]
+    fn abrir_em_pasta_inexistente_da_erro_claro() {
+        let path = std::env::temp_dir().join("margem-nao-existe-xyz").join("sub").join("a.sqlite3");
+        let err = Db::open(&path).err().expect("deveria falhar");
+        assert!(err.contains("Não foi possível abrir o banco de dados"), "{err}");
+    }
+
+    #[test]
+    fn migra_banco_antigo_sem_colunas_novas() {
+        let path = tmp_path("migra");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE documents(id TEXT PRIMARY KEY, name TEXT NOT NULL, path TEXT NOT NULL, page_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+                 CREATE TABLE pages(doc_id TEXT NOT NULL, n INTEGER NOT NULL, md TEXT NOT NULL, text TEXT NOT NULL, blocks TEXT NOT NULL, PRIMARY KEY(doc_id, n));
+                 CREATE TABLE cells(doc_id TEXT NOT NULL, column_id TEXT NOT NULL, value TEXT, quote TEXT, page INTEGER, status TEXT NOT NULL DEFAULT 'not_found', updated_at TEXT NOT NULL, PRIMARY KEY(doc_id, column_id));
+                 INSERT INTO documents VALUES('d1','Antigo','/a.pdf',1,'2025-01-01');
+                 INSERT INTO pages VALUES('d1',1,'md','texto','[]');
+                 INSERT INTO cells VALUES('d1','c1','v','q',1,'filled','2025-01-01');
+                 CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO settings VALUES('api_key','sk-antiga');",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let pages = db.pages("d1").unwrap();
+        assert_eq!(pages[0].text, "texto");
+        assert!(pages[0].lines.is_empty() && pages[0].figures.is_empty());
+        assert!(db.cells(Some("d1")).unwrap()[0].evidence.is_empty());
+        assert_eq!(db.setting("api_key").as_deref(), Some("sk-antiga"));
+        // abrir de novo não tenta recriar as colunas
+        drop(db);
+        Db::open(&path).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn acesso_concorrente_nao_corrompe() {
+        let db = std::sync::Arc::new(db());
+        let handles: Vec<_> = (0..8)
+            .map(|t| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        db.put_cell(&format!("d{t}"), &format!("c{i}"), Some("v"), None, None, "filled", &[]).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(db.cells(None).unwrap().len(), 200);
     }
 }

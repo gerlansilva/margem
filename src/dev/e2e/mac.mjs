@@ -1,0 +1,10 @@
+import { launch, open, importPdf, report } from './lib.mjs'
+const { browser, page, errors } = await launch({ mac: true })
+await open(page); await importPdf(page, 'artigo-1coluna')
+await page.keyboard.press('Meta+f'); await page.waitForTimeout(300)
+console.log('Cmd+F abre busca:', (await page.locator('.search-bar').count()) === 1)
+console.log('Ctrl+F (não deve abrir no mac):', await (async () => { await page.keyboard.press('Escape'); await page.keyboard.press('Control+f'); await page.waitForTimeout(200); return (await page.locator('.search-bar').count()) === 0 })())
+await page.keyboard.press('Meta+2'); await page.waitForTimeout(300)
+console.log('Cmd+2 fichamento:', await page.locator('.tab.active').innerText())
+console.log('rótulo:', await page.locator('.tab').first().getAttribute('title'))
+report(errors); await browser.close()
