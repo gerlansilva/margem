@@ -4,9 +4,24 @@ Leitor de PDF acadêmico com chat que cita página e trecho, e quadro de fichame
 
 ![Leitura com o assistente ao lado](docs/leitura.png)
 
+## Baixar
+
+Instaladores na página de [Releases](https://github.com/gerlansilva/margem/releases/latest):
+
+- **Windows**: `Margem_0.2.0_x64-setup.exe` (instalador) ou `Margem_0.2.0_x64_pt-BR.msi`.
+- **macOS**: `Margem_0.2.0_universal.dmg` (Apple Silicon e Intel). Não é assinado: na primeira abertura, clique com o botão direito no app e escolha **Abrir**.
+
+Na primeira execução, abra **Configurações** e cole a chave da DeepSeek.
+
 A pergunta nasce na margem: você lê o artigo, anota uma dúvida ao lado do parágrafo e a resposta volta apontando de onde saiu. Clicar em `p. 7` abre o PDF na página e destaca exatamente as linhas citadas.
 
 ![Citação resolvida em duas linhas, destacadas em âmbar](docs/citacao.png)
+
+![Fichamento com cabeçalho e coluna do documento fixos](docs/fichamento.png)
+
+![Notas e destaques](docs/notas.png)
+
+![Configurações, com a chave guardada no cofre do sistema](docs/configuracoes.png)
 
 ## O que faz
 
@@ -14,7 +29,12 @@ A pergunta nasce na margem: você lê o artigo, anota uma dúvida ao lado do par
 - **Conversa com o documento**; cada afirmação vem com `[D1 p.7]`. Clicar na citação abre a página do PDF com o trecho destacado.
 - **Seleciona um trecho** na leitura e pergunta sobre ele.
 - **Compara documentos**: outro PDF entra no escopo do chat (D1, D2…) e a pergunta pode comparar os dois.
-- **Fichamento**: você define as colunas (nome + instrução). A IA preenche cada célula com valor, trecho literal e página; sem trecho verificado a célula fica "não encontrado". Exporta CSV.
+- **Fichamento**: você define as colunas (nome + instrução). A IA preenche cada célula com valor, trecho literal e página; sem trecho verificado a célula fica "não encontrado".
+  - **Conjunto de documentos**: marque os documentos (na barra lateral ou na tabela) e extraia as colunas só para eles, com progresso por documento e botão Cancelar. Sem seleção, vale para todos. "Só vazias e não encontradas" refaz apenas o que falta.
+  - **Colunas**: o **+** no fim do cabeçalho cria uma coluna (nome e instrução), com atalhos prontos (Objetivo, Método, Amostra, Resultados, Limitações). Pelo cabeçalho dá para editar, mover, excluir e extrair só aquela coluna.
+  - **Cabeçalho e coluna do documento fixos** durante a rolagem, nos dois eixos.
+  - **Copiar**: tabela para colar no Excel, Word ou Docs, Markdown ou CSV, com ou sem página e trecho.
+- **Renomear documentos**: duplo clique (ou F2) no título, na barra lateral; o nome vale no leitor, no chat, no fichamento e nas exportações. "Restaurar original" volta ao nome do arquivo.
 - **Destaques e notas**: selecione um trecho na leitura, escolha uma de cinco cores e, se quiser, escreva uma nota. Ficam no banco local (SQLite), por documento, e saem em Markdown.
 - **Exportações**: conversa e notas em Markdown (`.md`), fichamento em CSV com vírgula ou ponto e vírgula (UTF-8 com BOM, abre certo no Excel em português). O app abre o diálogo "Salvar" do sistema e só grava `.md`, `.txt` e `.csv`.
 - **Respostas verificáveis**: se o modelo cita uma página que não foi enviada a ele, a citação aparece tracejada e com aviso. Resposta cortada pelo limite do modelo é sinalizada. Em falha de rede o chat mostra "Nova tentativa em 2 s…" antes de desistir.
@@ -67,7 +87,7 @@ O workflow `.github/workflows/build.yml` (GitHub Actions) roda em push na `main`
 - **Windows**: `.exe` (NSIS, instala só para o usuário) e `.msi`.
 - **macOS**: `.dmg` universal (Apple Silicon e Intel).
 
-Os arquivos ficam como artefatos da execução (14 dias). Ao empurrar uma tag `v*` (por exemplo `v0.2.0`) o workflow também cria um release rascunho com os instaladores.
+A cada push na `main` o workflow cria (ou atualiza) o release `v<versão>`, a versão vem de `src-tauri/tauri.conf.json`, e anexa os instaladores. Para lançar uma versão nova, aumente o número em `package.json`, `src-tauri/Cargo.toml` e `src-tauri/tauri.conf.json` e envie para a `main`. Os arquivos também ficam como artefatos da execução por 14 dias.
 
 **Aviso: os builds para Mac não são assinados nem notarizados.** Na primeira abertura o macOS bloqueia o app: arraste o Margem para Aplicativos, clique com o botão direito, escolha **Abrir** e confirme (ou, em Ajustes do Sistema > Privacidade e Segurança, **Abrir mesmo assim**). No Windows, o SmartScreen também pode avisar que o editor é desconhecido (**Mais informações > Executar assim mesmo**).
 
