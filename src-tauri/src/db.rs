@@ -120,12 +120,16 @@ impl Db {
         ensure_column(&conn, "documents", "original_title", "TEXT NOT NULL DEFAULT ''")?;
         conn.execute("UPDATE documents SET original_title=name WHERE original_title=''", [])
             .map_err(|e| format!("Falha ao migrar o banco de dados (documents.original_title): {e}"))?;
+        // 0.2.0 -> 0.3: índice de busca (FTS5), trechos/embeddings, cache e vínculos do OpenAlex.
+        // Só cria as tabelas; documentos antigos são indexados depois, em segundo plano.
+        crate::search::init_schema(&conn)?;
+        crate::openalex::init_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -213,6 +217,9 @@ impl Db {
             .map_err(|e| e.to_string())?;
         tx.execute("DELETE FROM annotations WHERE doc_id=?", params![id])
             .map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM openalex_links WHERE doc_id=?", params![id])
+            .map_err(|e| e.to_string())?;
+        crate::search::unindex_tx(&tx, id)?;
         tx.execute("DELETE FROM documents WHERE id=?", params![id])
             .map_err(|e| e.to_string())?;
         tx.commit().map_err(|e| e.to_string())
@@ -297,16 +304,28 @@ impl Db {
             params![pages.len() as i64, doc_id],
         )
         .map_err(|e| e.to_string())?;
+        // O índice de busca é atualizado na mesma transação das páginas.
+        let texts: Vec<(i64, &str)> = pages.iter().map(|p| (p.n, p.text.as_str())).collect();
+        crate::search::index_pages_tx(&tx, doc_id, &texts)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn pages(&self, doc_id: &str) -> Result<Vec<Page>, String> {
+        self.pages_limited(doc_id, -1)
+    }
+
+    /// Só as primeiras `n` páginas (SQLite: LIMIT negativo = sem limite).
+    pub fn pages_head(&self, doc_id: &str, n: i64) -> Result<Vec<Page>, String> {
+        self.pages_limited(doc_id, n)
+    }
+
+    fn pages_limited(&self, doc_id: &str, limit: i64) -> Result<Vec<Page>, String> {
         let conn = self.lock();
         let mut stmt = conn
-            .prepare("SELECT n,md,text,blocks,lines,figures FROM pages WHERE doc_id=? ORDER BY n")
+            .prepare("SELECT n,md,text,blocks,lines,figures FROM pages WHERE doc_id=? ORDER BY n LIMIT ?")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![doc_id], |r| {
+            .query_map(params![doc_id, limit], |r| {
                 let blocks: String = r.get(3)?;
                 let lines: String = r.get(4)?;
                 let figures: String = r.get(5)?;

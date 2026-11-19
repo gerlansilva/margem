@@ -6,7 +6,9 @@ export function shortcutList() {
   return [
     ['Adicionar PDF', shortcut('O')],
     ['Buscar no documento', shortcut('F')],
+    ['Buscar no acervo', shortcut('F', { shift: true })],
     ['Próximo / anterior resultado', 'Enter / Shift+Enter'],
+    ['Resultados da busca', '↑ ↓ / Enter'],
     ['Perguntar ao assistente', shortcut('K')],
     ['Leitura / Fichamento', `${shortcut('1')} / ${shortcut('2')}`],
     ['Configurações', shortcut(',')],

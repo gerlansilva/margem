@@ -23,7 +23,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # rustls com as raízes do Mozilla E as do sistema (Windows/macOS): redes
 # corporativas com proxy TLS só funcionam com o repositório de certificados do SO.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "system-proxy"] }
-tokio = { version = "1", features = ["time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 unicode-normalization = "0.1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
@@ -37,6 +37,10 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+
+[dev-dependencies]
+# só para os testes de rede (servidor local de mentira em src/testsrv.rs)
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(margem_keyring)'] }

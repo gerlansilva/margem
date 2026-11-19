@@ -4,6 +4,8 @@ import { mockIPC, mockWindows } from '@tauri-apps/api/mocks'
 import { emit } from '@tauri-apps/api/event'
 import { normalize } from '../pdf/layout'
 import { splitCitations } from '../lib/citations'
+import { foldAligned } from '../lib/search'
+import { normalizeDoi, normalizeTitle as comparableTitle } from '../lib/related'
 
 const state = {
   docs: [],
@@ -12,7 +14,19 @@ const state = {
   evidence: new Map(),
   columns: [],
   cells: [],
-  settings: { has_key: true, key_source: 'keychain', secure_storage: true, model: 'deepseek-flash', base_url: 'https://api.deepseek.com' },
+  settings: {
+    has_key: true,
+    key_source: 'keychain',
+    secure_storage: true,
+    model: 'deepseek-flash',
+    base_url: 'https://api.deepseek.com',
+    embed_base_url: '',
+    embed_model: '',
+    embed_key_set: false,
+    openalex_email: '',
+  },
+  links: {}, // docId -> workId (OpenAlex)
+  embedReady: false, // houve reindexação com embeddings configurados
   cancelled: new Set(),
   extracting: new Set(), // docIds em extração
   annotations: {}, // docId -> Annotation[]
@@ -35,6 +49,29 @@ const control = {
   calls: [],
   docIds: () => state.docs.map((d) => d.id),
   lastChat: null,
+  // Busca no acervo
+  searchDelayMs: 30,
+  searchFail: null, // texto do erro devolvido por search_library
+  index: null, // { done, total } força o estado "indexando"; null = tudo indexado
+  setIndex(done, total) {
+    control.index = { done, total }
+    return emit('index', { done, total })
+  },
+  clearIndex() {
+    const total = state.docs.filter((d) => pageCount(d.id) > 0).length
+    control.index = null
+    return emit('index', { done: total, total })
+  },
+  // OpenAlex
+  openalex: {
+    delayMs: 120,
+    lookup: null, // 'doi' | 'title' | 'none' | 'error' (força o cenário; padrão depende do documento)
+    lookupFail: null, // texto do erro de openalex_lookup
+    relatedFail: 0, // quantas chamadas de openalex_related falham antes de dar certo
+    relatedFailText: 'Não foi possível falar com o OpenAlex: tempo esgotado.',
+    downloadDelayMs: 350,
+    downloadFail: null, // texto do erro de download_pdf
+  },
 }
 window.__MOCK__ = control
 
@@ -216,6 +253,299 @@ function csvEscape(v, d = ',') {
   return v.includes(d) || /["\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v
 }
 
+// ------------------------------------------------------------ busca no acervo
+
+const SYNONYMS = [
+  ['amostra', 'participantes', 'populacao'],
+  ['professores', 'docentes'],
+  ['variabilidade', 'variacao'],
+  ['resultados', 'achados'],
+  ['media', 'mediana'],
+]
+
+const foldCp = (cp) => Array.from(foldAligned(cp))[0] ?? cp
+
+/** Variantes aceitas para um termo (só no modo híbrido). */
+function variantsOf(term, hybrid) {
+  if (!hybrid) return [term]
+  const group = SYNONYMS.find((g) => g.includes(term))
+  return group || [term]
+}
+
+function pageText(pg) {
+  return pg.text || pg.md || pg.lines.map((l) => l.text).join(' ')
+}
+
+/** Ranges (pontos de código) das variantes dentro do trecho já montado. */
+function rangesIn(snippet, variants) {
+  const cps = Array.from(snippet)
+  const folded = cps.map(foldCp)
+  const joined = folded.join('')
+  const cpAt = []
+  folded.forEach((f, i) => {
+    for (let k = 0; k < f.length; k += 1) cpAt[cpAt.length] = i
+  })
+  const out = []
+  for (const v of variants) {
+    for (let at = joined.indexOf(v); at >= 0; at = joined.indexOf(v, at + v.length)) {
+      const start = cpAt[at]
+      const end = cpAt[at + v.length - 1] + 1
+      out.push([start, end])
+    }
+  }
+  return out.sort((a, b) => a[0] - b[0])
+}
+
+function searchLibrary(query, docIds, limit) {
+  const terms = [...new Set(foldAligned(query).split(/\s+/).filter((t) => t.length >= 2))]
+  const embeddings = !!(state.settings.embed_base_url && state.settings.embed_model && state.embedReady)
+  const mode = embeddings ? 'hybrid' : 'lexical'
+  if (!terms.length) return { mode, hits: [] }
+  const scope = docIds?.length ? new Set(docIds) : null
+  const hits = []
+  for (const doc of state.docs) {
+    if (scope && !scope.has(doc.id)) continue
+    for (const pg of state.pages.get(doc.id) || []) {
+      const text = pageText(pg)
+      const folded = foldAligned(text)
+      const variantSets = terms.map((t) => variantsOf(t, embeddings))
+      let score = 0
+      let first = null
+      let ok = true
+      for (const variants of variantSets) {
+        let found = 0
+        for (const v of variants) {
+          for (let at = folded.indexOf(v); at >= 0; at = folded.indexOf(v, at + v.length)) {
+            found += 1
+            if (!first || at < first.at) first = { at, len: v.length, v }
+          }
+        }
+        if (!found) ok = false
+        score += found
+      }
+      if (!ok || !first) continue
+      const from = Math.max(0, first.at - 60)
+      const to = Math.min(text.length, first.at + first.len + 90)
+      let raw = text.slice(from, to).replace(/\s+/g, ' ').trim()
+      if (from > 0) raw = `… ${raw.replace(/^\S*\s/, '')}`
+      if (to < text.length) raw = `${raw.replace(/\s\S*$/, '')} …`
+      const ranges = rangesIn(raw, variantSets.flat())
+      const line = pg.lines.find((l) => variantSets.flat().some((v) => foldAligned(l.text).includes(v)))
+      hits.push({
+        doc_id: doc.id,
+        doc_title: doc.name,
+        page: pg.n,
+        score: Math.round((score / Math.sqrt(Math.max(1, text.length / 600))) * 100) / 100,
+        snippet: raw,
+        ranges,
+        quote: line ? line.text : raw.replace(/^… |…$/g, '').trim(),
+      })
+    }
+  }
+  hits.sort((a, b) => b.score - a.score || a.page - b.page)
+  return { mode, hits: hits.slice(0, Math.max(1, limit || 30)) }
+}
+
+function indexStatus() {
+  const indexable = state.docs.filter((d) => pageCount(d.id) > 0)
+  const forced = control.index
+  const total = forced ? forced.total : indexable.length
+  const indexed = forced ? forced.done : indexable.length
+  return {
+    docs_total: total,
+    docs_indexed: indexed,
+    chunks: indexable.reduce((n, d) => n + pageCount(d.id) * 3, 0),
+    embeddings: !!(state.settings.embed_base_url && state.settings.embed_model && state.embedReady),
+    model: state.settings.embed_model || null,
+    busy: !!forced && forced.done < forced.total,
+  }
+}
+
+async function runReindex() {
+  const total = state.docs.filter((d) => pageCount(d.id) > 0).length
+  for (let done = 0; done < total; done += 1) {
+    control.index = { done, total }
+    await emit('index', { done, total })
+    await sleep(160)
+  }
+  state.embedReady = !!(state.settings.embed_base_url && state.settings.embed_model)
+  control.index = null
+  await emit('index', { done: total, total })
+}
+
+// ---------------------------------------------------------------- OpenAlex
+
+const TOPICS = [
+  'letramento estatístico',
+  'variabilidade',
+  'probabilidade nos anos iniciais',
+  'formação de professores de matemática',
+  'pensamento estatístico',
+  'gráficos e tabelas',
+  'raciocínio inferencial',
+  'educação estocástica',
+  'análise de dados na escola básica',
+  'modelagem estatística',
+  'tecnologia no ensino de estatística',
+  'currículo de estatística',
+]
+const FRAMES = [
+  (t) => `${t[0].toUpperCase()}${t.slice(1)}: um estudo com professores`,
+  (t) => `Revisão sistemática sobre ${t}`,
+  (t) => `${t[0].toUpperCase()}${t.slice(1)} na educação básica: panorama e desafios`,
+  (t) => `Concepções de estudantes sobre ${t}`,
+  (t) => `Ensino de ${t}: propostas e limites`,
+  (t) => `${t[0].toUpperCase()}${t.slice(1)} em livros didáticos brasileiros`,
+]
+const QUALIFIERS = [
+  'no ensino fundamental',
+  'no ensino médio',
+  'na licenciatura',
+  'na educação de jovens e adultos',
+  'em escolas do campo',
+  'em tempos de ensino remoto',
+  'a partir de uma sequência didática',
+  'sob uma perspectiva crítica',
+  'com uso de planilhas',
+  'em grupos colaborativos',
+]
+const PEOPLE = [
+  'Celi Espasandin Lopes',
+  'Carmen Batanero',
+  'Iddo Gal',
+  'Cileda de Queiroz e Silva Coutinho',
+  'Sandra Maria Pinto Magina',
+  'Ana Paula Santana',
+  'Marcos Roberto Almeida',
+  'Juliana Ferreira Campos',
+  'Rafael Moreira Tavares',
+  'Dolores Ferreira Santos',
+  'Pedro Henrique Barros',
+  'Vera Lúcia Sales',
+]
+const VENUES = [
+  'Bolema',
+  'Zetetiké',
+  'Educação Matemática Pesquisa',
+  'Statistics Education Research Journal',
+  'RELIME',
+  'Revista Paranaense de Educação Matemática',
+  'Cadernos Cedes',
+  'Journal of Statistics Education',
+  null,
+]
+const POOL_SIZE = 120
+const PAGE_SIZE = 10
+const TOTALS = { related: 24, references: 37, cited_by: 52 }
+const wid = (n) => `https://openalex.org/W${n}`
+
+function poolWork(i) {
+  const n = 2000 + i
+  const authors = Array.from({ length: 1 + (i % 5) }, (_, k) => PEOPLE[(i * 3 + k * 5) % PEOPLE.length])
+  const oa = i % 3 !== 1
+  return {
+    id: wid(n),
+    doi: i % 11 === 5 ? null : `10.5555/mock.${n}`,
+    title: `${FRAMES[i % FRAMES.length](TOPICS[(i * 7) % TOPICS.length])} ${QUALIFIERS[Math.floor(i / 12) % QUALIFIERS.length]}`,
+    authors,
+    authors_total: authors.length + (i % 4 === 0 ? 3 : 0),
+    year: 1998 + ((i * 5) % 27),
+    venue: VENUES[i % VENUES.length],
+    cited_by_count: (i * 37) % 410,
+    is_oa: oa,
+    oa_url: !oa ? null : i % 2 === 0 ? `https://repositorio.example.org/arquivos/W${n}.pdf` : `https://www.scielo.example.org/artigo/W${n}`,
+    abstract: i % 5 === 0 ? 'Resumo fictício do trabalho, usado só no mock.' : null,
+    url: wid(n),
+  }
+}
+
+/** O trabalho que o mock identifica por DOI para `artigo-2colunas`. */
+const DOI_WORK = {
+  id: wid(1001),
+  doi: '10.5555/mock.letramento',
+  title: 'Letramento estatístico de professores: um estudo no Brasil',
+  authors: ['Ana Souza', 'Carlos Pereira'],
+  authors_total: 2,
+  year: 2021,
+  venue: 'Educação Matemática Pesquisa',
+  cited_by_count: 128,
+  is_oa: true,
+  oa_url: 'https://repositorio.example.org/arquivos/letramento.pdf',
+  abstract: null,
+  url: wid(1001),
+}
+const TITLE_CANDIDATES = [
+  { ...poolWork(41), id: wid(1002), title: 'Variabilidade e amostragem no ensino médio: um estudo exploratório', doi: '10.5555/mock.1002', year: 2018 },
+  { ...poolWork(42), id: wid(1003), title: 'Variabilidade e amostragem: concepções de professores', doi: null, year: 2015, is_oa: false, oa_url: null },
+  { ...poolWork(43), id: wid(1004), title: 'Variabilidade em contextos de formação estatística', year: 2022 },
+]
+const ALL_BASE = [DOI_WORK, ...TITLE_CANDIDATES]
+
+function findWork(id) {
+  const base = ALL_BASE.find((w) => w.id === id)
+  if (base) return base
+  const n = Number(String(id).replace(/\D/g, '')) - 2000
+  return n >= 0 && n < POOL_SIZE ? poolWork(n) : null
+}
+
+function allWorks() {
+  return [...ALL_BASE, ...Array.from({ length: POOL_SIZE }, (_, i) => poolWork(i))]
+}
+
+function docScenario(doc) {
+  const forced = control.openalex.lookup
+  if (forced) return forced
+  const name = doc.original_title ?? doc.name
+  if (/artigo-2colunas/.test(name)) return 'doi'
+  if (/artigo-1coluna/.test(name)) return 'title'
+  return 'none'
+}
+
+async function openalexLookup(docId, query) {
+  const doc = state.docs.find((d) => d.id === docId)
+  if (!doc) throw 'Documento não encontrado.'
+  await sleep(control.openalex.delayMs)
+  if (control.openalex.lookupFail) throw control.openalex.lookupFail
+  const q = String(query ?? '').trim()
+  if (q) {
+    const doi = normalizeDoi(q)
+    const all = allWorks()
+    let found
+    if (doi) found = all.filter((w) => normalizeDoi(w.doi) === doi)
+    else {
+      const terms = comparableTitle(q).split(' ').filter(Boolean)
+      found = all.filter((w) => terms.every((t) => comparableTitle(w.title).includes(t)))
+    }
+    found = found.slice(0, 5)
+    return { source: 'manual', work: found[0] || null, candidates: found }
+  }
+  const linked = state.links[docId]
+  if (linked) return { source: 'link', work: findWork(linked), candidates: [] }
+  const scenario = docScenario(doc)
+  if (scenario === 'error') throw 'Não foi possível falar com o OpenAlex: sem conexão.'
+  if (scenario === 'doi') return { source: 'doi', work: DOI_WORK, candidates: [] }
+  if (scenario === 'title') return { source: 'title', work: TITLE_CANDIDATES[0], candidates: TITLE_CANDIDATES }
+  return { source: 'title', work: null, candidates: [] }
+}
+
+async function openalexRelated(workId, kind, page) {
+  if (!TOTALS[kind]) throw `Tipo inválido: ${kind}`
+  await sleep(control.openalex.delayMs)
+  if (control.openalex.relatedFail > 0) {
+    control.openalex.relatedFail -= 1
+    throw control.openalex.relatedFailText
+  }
+  const total = TOTALS[kind]
+  const p = Math.max(1, Number(page) || 1)
+  const seed = Number(String(workId).replace(/\D/g, '')) || 0
+  const kindShift = kind === 'related' ? 0 : kind === 'references' ? 17 : 31
+  const works = []
+  for (let k = (p - 1) * PAGE_SIZE; k < Math.min(total, p * PAGE_SIZE); k += 1) {
+    works.push(poolWork((seed + kindShift + k * 7) % POOL_SIZE))
+  }
+  return { works, total, page: p }
+}
+
 async function handle(cmd, payload = {}) {
   control.calls.push({ cmd, payload })
   switch (cmd) {
@@ -272,6 +602,7 @@ async function handle(cmd, payload = {}) {
       state.pages.delete(payload.docId)
       state.cells = state.cells.filter((c) => c.doc_id !== payload.docId)
       delete state.annotations[payload.docId]
+      delete state.links[payload.docId]
       return null
     case 'save_pages': {
       await sleep(20)
@@ -298,11 +629,51 @@ async function handle(cmd, payload = {}) {
       state.settings.key_source = payload.apiKey ? 'keychain' : state.settings.key_source
       state.settings.model = payload.model || state.settings.model
       state.settings.base_url = payload.baseUrl || state.settings.base_url
+      if (payload.embedBaseUrl !== undefined && payload.embedBaseUrl !== null) {
+        const url = String(payload.embedBaseUrl).trim()
+        if (url && !/^https?:\/\//i.test(url)) throw 'A URL dos embeddings precisa começar com http:// ou https://'
+        state.settings.embed_base_url = url
+      }
+      if (payload.embedModel !== undefined && payload.embedModel !== null) state.settings.embed_model = String(payload.embedModel).trim()
+      if (payload.embedKey) state.settings.embed_key_set = true
+      if (payload.openalexEmail !== undefined && payload.openalexEmail !== null) state.settings.openalex_email = String(payload.openalexEmail).trim()
       return state.settings
     case 'clear_api_key':
       state.settings.has_key = false
       state.settings.key_source = 'none'
       return state.settings
+    // ---- busca no acervo
+    case 'search_library': {
+      await sleep(control.searchDelayMs)
+      if (control.searchFail) throw control.searchFail
+      return searchLibrary(String(payload.query ?? ''), payload.docIds, payload.limit)
+    }
+    case 'index_status':
+      return indexStatus()
+    case 'reindex':
+      runReindex()
+      return null
+    // ---- OpenAlex
+    case 'openalex_lookup':
+      return openalexLookup(payload.docId, payload.query)
+    case 'openalex_link': {
+      if (!state.docs.some((d) => d.id === payload.docId)) throw 'Documento não encontrado.'
+      await sleep(40)
+      if (payload.workId) {
+        if (!findWork(payload.workId)) throw 'Trabalho não encontrado no OpenAlex.'
+        state.links[payload.docId] = payload.workId
+      } else delete state.links[payload.docId]
+      return null
+    }
+    case 'openalex_related':
+      return openalexRelated(payload.workId, payload.kind, payload.page)
+    case 'download_pdf': {
+      await sleep(control.openalex.downloadDelayMs)
+      if (!/^https?:\/\//i.test(String(payload.url || ''))) throw 'Endereço inválido.'
+      if (control.openalex.downloadFail) throw control.openalex.downloadFail
+      if (/bloqueado/.test(payload.url)) throw 'Não foi possível baixar o PDF: o servidor respondeu 403 (acesso negado).'
+      return { path: '/__fixtures__/uma-pagina.pdf', name: 'uma-pagina.pdf' }
+    }
     // ---- fichamento
     case 'get_columns':
       return state.columns

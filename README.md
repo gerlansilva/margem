@@ -36,6 +36,8 @@ A pergunta nasce na margem: você lê o artigo, anota uma dúvida ao lado do par
   - **Copiar**: tabela para colar no Excel, Word ou Docs, Markdown ou CSV, com ou sem página e trecho.
 - **Renomear documentos**: duplo clique (ou F2) no título, na barra lateral; o nome vale no leitor, no chat, no fichamento e nas exportações. "Restaurar original" volta ao nome do arquivo.
 - **Destaques e notas**: selecione um trecho na leitura, escolha uma de cinco cores e, se quiser, escreva uma nota. Ficam no banco local (SQLite), por documento, e saem em Markdown.
+- **Busca no acervo**: procura em todos os PDFs (ou só nos selecionados), com resultados agrupados por documento, página e termos destacados. Enter ou clique abre a página no PDF com o trecho marcado. Funciona por palavras; com um endpoint de embeddings configurado, passa a achar também por significado. O rodapé mostra o modo e o andamento da indexação.
+- **Relacionados (OpenAlex)**: aba ao lado de Assistente e Notas. Identifica o trabalho do documento (por vínculo salvo, DOI ou título), com Confirmar, Trocar e Desvincular, e lista relacionados, referências e citado por. Cada item abre no navegador, copia referência ou DOI e, quando o acesso aberto traz um PDF direto, **Baixar e adicionar** à biblioteca. Itens que já estão na biblioteca vêm marcados.
 - **Exportações**: conversa e notas em Markdown (`.md`), fichamento em CSV com vírgula ou ponto e vírgula (UTF-8 com BOM, abre certo no Excel em português). O app abre o diálogo "Salvar" do sistema e só grava `.md`, `.txt` e `.csv`.
 - **Respostas verificáveis**: se o modelo cita uma página que não foi enviada a ele, a citação aparece tracejada e com aviso. Resposta cortada pelo limite do modelo é sinalizada. Em falha de rede o chat mostra "Nova tentativa em 2 s…" antes de desistir.
 - **Chave da DeepSeek no cofre do sistema** (Keychain no macOS, Credential Manager no Windows), nunca em arquivo do projeto. Em Configurações aparece onde a chave está guardada e há o botão **Remover chave**.
@@ -48,6 +50,7 @@ No macOS use Cmd no lugar de Ctrl.
 | --- | --- |
 | Ctrl+O | Adicionar PDF |
 | Ctrl+F | Buscar no documento (Enter / Shift+Enter: próximo / anterior) |
+| Ctrl+Shift+F | Buscar no acervo (↑ ↓ percorre, Enter abre, Esc fecha) |
 | Ctrl+K | Perguntar ao assistente |
 | Ctrl+1 / Ctrl+2 | Leitura / Fichamento |
 | Ctrl+, | Configurações |
@@ -111,6 +114,8 @@ Dentro dela:
 - Figuras recortadas: `figures/<doc>/<página>-<n>.png`
 
 A chave da API **não** fica no banco: vai para o Keychain (macOS) ou o Credential Manager (Windows). Chaves que versões antigas guardavam no SQLite são movidas para o cofre automaticamente na primeira abertura; só se o cofre do sistema não estiver disponível a chave cai de volta para o banco, e as Configurações avisam. Os destaques da versão 0.1 (que ficavam no armazenamento do navegador embutido) são migrados para o banco uma única vez, ao abrir o documento.
+
+Em **Configurações**: a seção **Busca por significado (opcional)** recebe a URL, o modelo e a chave de um endpoint de embeddings compatível com OpenAI (por exemplo Ollama: `http://localhost:11434/v1` e `nomic-embed-text`); **Reindexar** reconstrói o índice. O campo **E-mail** do OpenAlex identifica o app nas consultas (pool educado, opcional).
 
 Para apagar tudo, feche o app e remova essa pasta (e a chave, em Configurações > Remover chave).
 

@@ -1,6 +1,10 @@
 mod ai;
+mod asyncutil;
 mod cancel;
 mod db;
+mod download;
+mod embed;
+mod engine;
 mod evidence;
 mod export;
 mod fichamento;
@@ -8,12 +12,18 @@ mod files;
 mod keystore;
 mod model;
 mod net;
+mod oa_client;
+mod openalex;
+mod search;
 mod secrets;
+#[cfg(test)]
+mod testsrv;
 #[cfg(test)]
 mod tests;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -22,8 +32,10 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use ai::DocContext;
+use asyncutil::{sleep_or_cancel, wait_cancelled};
 use cancel::{BusyDocs, CancelRegistry};
 use db::Db;
+use embed::EmbedConfig;
 use model::{Cell, ChatRequest, Column, Doc, Evidence, Page};
 use net::NetErrorKind;
 use secrets::{KeySource, SecretStore};
@@ -32,6 +44,9 @@ const DEFAULT_MODEL: &str = "deepseek-flash";
 const DEFAULT_BASE_URL: &str = "https://api.deepseek.com";
 /// Chave do SQLite onde a chave da API ficava antes do cofre do sistema.
 const KEY_SETTING: &str = "api_key";
+const EMBED_URL_SETTING: &str = "embed_base_url";
+const EMBED_MODEL_SETTING: &str = "embed_model";
+const OPENALEX_EMAIL_SETTING: &str = "openalex_email";
 /// Espera pelo início da resposta do chat (o stream em si não tem teto total).
 const CHAT_HEADER_TIMEOUT: Duration = Duration::from_secs(120);
 /// Extração não usa stream: o corpo só chega quando o modelo termina.
@@ -41,8 +56,15 @@ const MAX_CONCURRENT_EXTRACTS: usize = 3;
 const MAX_FIGURE_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct AppState {
-    db: Db,
+    /// `Arc` porque a indexação em segundo plano usa o banco de outra thread.
+    db: Arc<Db>,
     http: reqwest::Client,
+    /// Cliente só dos downloads de PDF (no máximo 5 redirecionamentos, só https).
+    download_http: reqwest::Client,
+    /// Indexação (lexical e embeddings) em segundo plano.
+    index: engine::IndexManager,
+    /// Chave (opcional) do servidor de embeddings; nunca vai para o SQLite.
+    embed_vault: Box<dyn SecretStore>,
     cancel: CancelRegistry,
     /// Documentos em extração (um por vez cada).
     busy_docs: BusyDocs,
@@ -86,6 +108,23 @@ impl AppState {
         Ok(AiConfig { key, model: self.model(), base_url })
     }
 
+    /// Servidor de embeddings configurado (URL + modelo válidos), com a chave do cofre se houver.
+    fn embed_config(&self) -> Option<EmbedConfig> {
+        embed::config_from_settings(
+            self.db.setting(EMBED_URL_SETTING),
+            self.db.setting(EMBED_MODEL_SETTING),
+            self.embed_vault.get().ok().flatten(),
+        )
+    }
+
+    fn openalex_email(&self) -> Option<String> {
+        self.db.setting(OPENALEX_EMAIL_SETTING).filter(|e| !e.trim().is_empty())
+    }
+
+    fn oa_client(&self) -> oa_client::OaClient<'_> {
+        oa_client::OaClient::new(&self.http, &self.db, env!("CARGO_PKG_VERSION"), self.openalex_email())
+    }
+
     fn settings_json(&self) -> Value {
         let (key, source) = self.api_key();
         json!({
@@ -95,7 +134,13 @@ impl AppState {
             // O cofre do sistema (Keychain/Credential Manager) está funcionando?
             "secure_storage": self.vault.get().is_ok(),
             "model": self.model(),
-            "base_url": self.base_url()
+            "base_url": self.base_url(),
+            // Busca semântica opcional (servidor compatível com OpenAI, ex.: Ollama).
+            // "" quando não configurado. A chave nunca é devolvida.
+            "embed_base_url": self.db.setting(EMBED_URL_SETTING).unwrap_or_default(),
+            "embed_model": self.db.setting(EMBED_MODEL_SETTING).unwrap_or_default(),
+            "embed_key_set": self.embed_vault.get().ok().flatten().is_some_and(|k| !k.trim().is_empty()),
+            "openalex_email": self.openalex_email().unwrap_or_default()
         })
     }
 }
@@ -183,9 +228,13 @@ fn delete_doc(app: AppHandle, state: State<'_, AppState>, doc_id: String) -> Res
     state.db.delete_doc(&doc_id)
 }
 
+/// Grava as páginas e já atualiza o índice de busca (mesma transação). Se houver
+/// servidor de embeddings configurado, a vetorização dos trechos novos segue em segundo plano.
 #[tauri::command]
-fn save_pages(state: State<'_, AppState>, doc_id: String, pages: Vec<Page>) -> Result<(), String> {
-    state.db.save_pages(&doc_id, &pages)
+fn save_pages(app: AppHandle, state: State<'_, AppState>, doc_id: String, pages: Vec<Page>) -> Result<(), String> {
+    state.db.save_pages(&doc_id, &pages)?;
+    start_index(&app);
+    Ok(())
 }
 
 /// Grava o recorte de uma figura/quadro em <dados>/figures/<doc>/<página>-<n>.png.
@@ -225,12 +274,30 @@ fn get_settings(state: State<'_, AppState>) -> Value {
     state.settings_json()
 }
 
+/// Texto da configuração opcional: `None` não mexe; vazio limpa; senão valida.
+fn optional_setting(
+    raw: Option<String>,
+    validate: impl Fn(&str) -> Result<String, String>,
+) -> Result<Option<Option<String>>, String> {
+    match raw {
+        None => Ok(None),
+        Some(r) if r.trim().is_empty() => Ok(Some(None)),
+        Some(r) => validate(&r).map(|v| Some(Some(v))),
+    }
+}
+
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 fn save_settings(
+    app: AppHandle,
     state: State<'_, AppState>,
     api_key: Option<String>,
     model: Option<String>,
     base_url: Option<String>,
+    embed_base_url: Option<String>,
+    embed_model: Option<String>,
+    embed_key: Option<String>,
+    openalex_email: Option<String>,
 ) -> Result<Value, String> {
     // Valida tudo antes de gravar qualquer coisa: salvar pela metade confunde.
     let key = api_key
@@ -245,6 +312,20 @@ fn save_settings(
         .filter(|b| !b.trim().is_empty())
         .map(|b| net::validate_base_url(&b))
         .transpose()?;
+    // Em embed_base_url/embed_model/openalex_email, texto vazio LIMPA o campo (desliga a busca semântica).
+    let new_embed_url = optional_setting(embed_base_url, embed::validate_embed_url)?;
+    let new_embed_model = optional_setting(embed_model, embed::validate_embed_model)?;
+    let new_email = optional_setting(openalex_email, openalex::clean_email)?;
+    let new_embed_key = embed_key
+        .filter(|k| !k.trim().is_empty())
+        .map(|k| net::clean_api_key(&k))
+        .transpose()?;
+    let old_embed_model = state.db.setting(EMBED_MODEL_SETTING);
+    let final_url = new_embed_url.clone().unwrap_or_else(|| state.db.setting(EMBED_URL_SETTING));
+    let final_model = new_embed_model.clone().unwrap_or_else(|| old_embed_model.clone());
+    if final_url.is_some() && final_model.is_none() {
+        return Err("Informe o nome do modelo de embeddings (exemplo: nomic-embed-text).".into());
+    }
 
     if let Some(key) = key {
         match secrets::save_key(&*state.vault, &key) {
@@ -256,12 +337,42 @@ fn save_settings(
             }
         }
     }
+    if let Some(key) = &new_embed_key {
+        // A chave dos embeddings só vai para o cofre: sem cofre, não grava (nada em texto puro).
+        secrets::save_key(&*state.embed_vault, key).map_err(|why| {
+            format!("Não foi possível guardar a chave de embeddings com segurança ({why}). Ela nunca é salva em texto puro; deixe o campo vazio se o servidor não exige chave.")
+        })?;
+    }
     if let Some(m) = model {
         state.db.set_setting("model", &m)?;
     }
     if let Some(b) = base_url {
         state.db.set_setting("base_url", &b)?;
     }
+    let mut embed_changed = new_embed_key.is_some();
+    for (name, value) in [(EMBED_URL_SETTING, &new_embed_url), (EMBED_MODEL_SETTING, &new_embed_model), (OPENALEX_EMAIL_SETTING, &new_email)] {
+        match value {
+            Some(Some(v)) => state.db.set_setting(name, v)?,
+            Some(None) => state.db.delete_setting(name)?,
+            None => continue,
+        }
+        embed_changed |= name != OPENALEX_EMAIL_SETTING;
+    }
+    if new_embed_model.is_some() && state.db.setting(EMBED_MODEL_SETTING) != old_embed_model {
+        // Outro modelo = outro espaço vetorial: descarta os vetores e refaz.
+        state.db.clear_embeddings()?;
+    }
+    if embed_changed {
+        state.index.request_cancel();
+        start_index(&app);
+    }
+    Ok(state.settings_json())
+}
+
+/// Remove a chave dos embeddings do cofre do sistema.
+#[tauri::command]
+fn clear_embed_key(state: State<'_, AppState>) -> Result<Value, String> {
+    state.embed_vault.delete()?;
     Ok(state.settings_json())
 }
 
@@ -307,32 +418,6 @@ fn net_kind(e: &reqwest::Error) -> NetErrorKind {
 fn net_message(e: reqwest::Error) -> String {
     let kind = net_kind(&e);
     net::net_error_message(kind, &e.without_url().to_string())
-}
-
-/// Espera `d`, acordando a cada 100 ms para ver o cancelamento. `true` se cancelou.
-async fn sleep_or_cancel(d: Duration, cancel: Option<&AtomicBool>) -> bool {
-    let deadline = Instant::now() + d;
-    loop {
-        if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
-    }
-}
-
-async fn wait_cancelled(cancel: Option<&AtomicBool>) {
-    match cancel {
-        Some(flag) => {
-            while !flag.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        None => std::future::pending::<()>().await,
-    }
 }
 
 /// POST com nova tentativa em 429/5xx e falha de conexão (backoff exponencial,
@@ -850,6 +935,127 @@ fn cancel_chat(state: State<'_, AppState>, request_id: String) {
     state.cancel.cancel(&request_id);
 }
 
+// ------------------------------------------------------------------ busca
+
+/// Indexação em segundo plano (lexical e, se configurado, embeddings). Se já há
+/// uma rodando, só agenda outra rodada. Emite o evento `index`:
+/// `{phase: "lexical"|"embeddings"|"idle", done, total, busy, error}`.
+fn start_index(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app.state::<AppState>();
+        let emit = |payload: Value| {
+            if let Err(e) = app.emit("index", payload) {
+                eprintln!("falha ao emitir evento index: {e}");
+            }
+        };
+        engine::run_loop(&state.index, &state.db, &state.http, &|| state.embed_config(), &emit).await;
+    });
+}
+
+/// Busca em todos os documentos (ou só em `doc_ids`). Lexical (FTS5/BM25, sem
+/// acentos); híbrida com RRF quando há embeddings do modelo atual.
+#[tauri::command]
+async fn search_library(
+    state: State<'_, AppState>,
+    query: String,
+    doc_ids: Option<Vec<String>>,
+    limit: Option<usize>,
+) -> Result<search::SearchResult, String> {
+    let cfg = state.embed_config();
+    engine::run_search(&state.db, &state.http, cfg.as_ref(), &query, doc_ids, limit.unwrap_or(30)).await
+}
+
+#[tauri::command]
+fn index_status(state: State<'_, AppState>) -> Result<engine::IndexStatus, String> {
+    engine::index_status(&state.db, &state.index, state.embed_config().as_ref())
+}
+
+/// Refaz o índice de um documento (ou de todos) em segundo plano.
+#[tauri::command]
+async fn reindex(app: AppHandle, state: State<'_, AppState>, doc_id: Option<String>) -> Result<(), String> {
+    let db = state.db.clone();
+    match doc_id {
+        Some(id) => {
+            if db.get_doc(&id)?.is_none() {
+                return Err("Documento não encontrado.".into());
+            }
+            tauri::async_runtime::spawn_blocking(move || db.reindex_doc(&id))
+                .await
+                .map_err(|e| e.to_string())??;
+        }
+        None => db.invalidate_index()?,
+    }
+    start_index(&app);
+    Ok(())
+}
+
+// --------------------------------------------------------------- OpenAlex
+
+#[tauri::command]
+async fn openalex_lookup(
+    state: State<'_, AppState>,
+    doc_id: String,
+    query: Option<String>,
+) -> Result<oa_client::Lookup, String> {
+    let doc = state.db.get_doc(&doc_id)?.ok_or("Documento não encontrado.")?;
+    let linked = state.db.oa_link_get(&doc_id);
+    let manual = query.as_deref().is_some_and(|q| !q.trim().is_empty());
+    // Só as primeiras páginas interessam (DOI e título); carregar o resto seria desperdício.
+    let pages = if manual { vec![] } else { state.db.pages_head(&doc_id, 3)? };
+    state
+        .oa_client()
+        .lookup(&doc, &pages, query.as_deref(), linked.as_deref())
+        .await
+        .map_err(|e| e.message())
+}
+
+/// Salva (`work_id`) ou remove (`null`) o vínculo do documento com um trabalho do OpenAlex.
+#[tauri::command]
+fn openalex_link(state: State<'_, AppState>, doc_id: String, work_id: Option<String>) -> Result<(), String> {
+    if state.db.get_doc(&doc_id)?.is_none() {
+        return Err("Documento não encontrado.".into());
+    }
+    match work_id {
+        Some(w) => {
+            let id = openalex::short_id(&w).ok_or("Identificador de trabalho inválido.")?;
+            state.db.oa_link_set(&doc_id, Some(&id))
+        }
+        None => state.db.oa_link_set(&doc_id, None),
+    }
+}
+
+/// `kind`: "related" | "references" | "cited_by"; 25 por página.
+#[tauri::command]
+async fn openalex_related(
+    state: State<'_, AppState>,
+    work_id: String,
+    kind: String,
+    page: Option<usize>,
+) -> Result<oa_client::Related, String> {
+    let kind = oa_client::RelKind::parse(&kind)?;
+    state
+        .oa_client()
+        .related(&work_id, kind, page.unwrap_or(1))
+        .await
+        .map_err(|e| e.message())
+}
+
+/// Baixa um PDF aberto (https) para a pasta temporária do app; o frontend o
+/// importa depois com `import_doc(path)`.
+#[tauri::command]
+async fn download_pdf(app: AppHandle, state: State<'_, AppState>, url: String) -> Result<Value, String> {
+    let root = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Não foi possível localizar a pasta temporária do aplicativo: {e}"))?
+        .join("downloads");
+    std::fs::create_dir_all(&root).map_err(|e| format!("Não foi possível criar a pasta temporária: {e}"))?;
+    download::cleanup_old(&root);
+    let (path, name) = download::fetch_pdf(&state.download_http, &url, &root, true, download::MAX_PDF_BYTES).await?;
+    Ok(json!({ "path": path.to_string_lossy(), "name": name }))
+}
+
 // ------------------------------------------------------------------- run
 
 pub fn run() {
@@ -859,7 +1065,7 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(dir.join("uploads"))?;
-            let db = Db::open(&dir.join("pdfchat.sqlite3"))?;
+            let db = Arc::new(Db::open(&dir.join("pdfchat.sqlite3"))?);
             let vault = keystore::system_store();
 
             // Migração automática: a chave que versões antigas guardavam em texto
@@ -885,14 +1091,24 @@ pub fn run() {
                 .user_agent(concat!("Margem/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .map_err(|e| format!("Não foi possível iniciar o cliente de rede: {e}"))?;
+            let download_http = download::build_client(true)?;
+            if let Ok(cache) = app.path().app_cache_dir() {
+                download::cleanup_old(&cache.join("downloads"));
+            }
             app.manage(AppState {
                 db,
                 http,
+                download_http,
+                index: engine::IndexManager::default(),
+                embed_vault: keystore::system_store_for(keystore::ACCOUNT_EMBED),
                 cancel: CancelRegistry::new(),
                 busy_docs: BusyDocs::default(),
                 extract_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EXTRACTS)),
                 vault,
             });
+            // Documentos de versões antigas (e vetores pendentes) são indexados em
+            // segundo plano: o app abre sem esperar.
+            start_index(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -908,6 +1124,14 @@ pub fn run() {
             get_settings,
             save_settings,
             clear_api_key,
+            clear_embed_key,
+            search_library,
+            index_status,
+            reindex,
+            openalex_lookup,
+            openalex_link,
+            openalex_related,
+            download_pdf,
             get_columns,
             save_columns,
             get_cells,

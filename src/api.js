@@ -82,6 +82,24 @@ export const api = {
 
   clearApiKey: () => invoke('clear_api_key'),
 
+  // ------------------------------------------------------------------ busca
+  /** { mode: 'lexical'|'hybrid', hits: [{ doc_id, doc_title, page, score, snippet, ranges, quote }] } */
+  searchLibrary: (query, docIds, limit = 30) =>
+    invoke('search_library', { query, docIds: docIds?.length ? docIds : null, limit }),
+  /** { docs_total, docs_indexed, chunks, embeddings, model, busy } */
+  indexStatus: () => invoke('index_status'),
+  reindex: (docId) => invoke('reindex', { docId: docId || null }),
+
+  // --------------------------------------------------------------- OpenAlex
+  /** { source: 'link'|'doi'|'title'|'manual', work, candidates } */
+  openalexLookup: (docId, query) => invoke('openalex_lookup', { docId, query: query || null }),
+  /** `workId` null desvincula. */
+  openalexLink: (docId, workId) => invoke('openalex_link', { docId, workId: workId || null }),
+  /** kind: 'related' | 'references' | 'cited_by'. -> { works, total, page } */
+  openalexRelated: (workId, kind, page = 1) => invoke('openalex_related', { workId, kind, page }),
+  /** Baixa um PDF aberto; devolve { path, name } para o fluxo normal de importação. */
+  downloadPdf: (url) => invoke('download_pdf', { url }),
+
   // -------------------------------------------------------------- anotações
   // No Tauri ficam no SQLite do backend; no navegador (sem backend), no IndexedDB.
 

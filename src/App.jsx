@@ -6,6 +6,7 @@ import { Sidebar } from './components/Sidebar'
 import { Reader } from './components/Reader'
 import { ChatPanel } from './components/ChatPanel'
 import { NotesPanel } from './components/NotesPanel'
+import { RelatedPanel } from './components/RelatedPanel'
 import { Icon } from './components/Icons'
 import { PasswordModal } from './components/PasswordModal'
 import { buildFichamentoCsv } from './lib/csv'
@@ -13,10 +14,12 @@ import { mergeCells, planExtraction, pruneSelection, runExtractionJob } from './
 import { conversationToMarkdown, notesToMarkdown, safeFileName } from './lib/exporters'
 import { createAnnotation, normalizeAnnotations } from './lib/annotations'
 import { hasMod, isTyping, shortcut } from './lib/platform'
+import { indexLabel } from './lib/library-search'
 
 // Peças pesadas ou raras saem do primeiro carregamento.
 const Fichamento = lazy(() => import('./components/Fichamento').then((m) => ({ default: m.Fichamento })))
 const SourceModal = lazy(() => import('./components/SourceModal').then((m) => ({ default: m.SourceModal })))
+const SearchPanel = lazy(() => import('./components/SearchPanel').then((m) => ({ default: m.SearchPanel })))
 const SettingsModal = lazy(() => import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal })))
 const ShortcutsModal = lazy(() => import('./components/ShortcutsModal').then((m) => ({ default: m.ShortcutsModal })))
 
@@ -51,6 +54,10 @@ export default function App() {
   const [readerFocus, setReaderFocus] = useState(null)
   const [navOpen, setNavOpen] = useState(false)
   const [chatOpen, setChatOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchSaved, setSearchSaved] = useState({ query: '', scope: 'all' })
+  const [indexStatus, setIndexStatus] = useState(null)
+  const [indexProgress, setIndexProgress] = useState(null)
 
   const toastTimer = useRef(null)
   const abortRef = useRef(null)
@@ -221,8 +228,8 @@ export default function App() {
     return { pages: pages.length, figures }
   }
 
-  async function addDocs(input) {
-    if (importing.current) return
+  async function addDocs(input, { select = true } = {}) {
+    if (importing.current) return null
     let paths = input
     if (!Array.isArray(paths)) {
       // Só aceita texto: um evento de clique aqui virava "caminho do arquivo".
@@ -237,11 +244,11 @@ export default function App() {
         paths = Array.isArray(picked) ? picked : picked ? [picked] : []
       } catch (error) {
         notify(`Não foi possível abrir o seletor de arquivos: ${errorText(error)}`, 'error')
-        return
+        return null
       }
     }
     paths = paths.filter(Boolean)
-    if (!paths.length) return
+    if (!paths.length) return null
     importing.current = true
     const controller = new AbortController()
     abortRef.current = controller
@@ -264,10 +271,11 @@ export default function App() {
         }
       }
       setDocs(await api.listDocs())
-      if (lastOk) {
+      if (lastOk && select) {
         setView('reader')
         await selectDoc(lastOk)
       }
+      refreshIndex()
     } catch (error) {
       notify(`Falha ao importar: ${errorText(error)}`, 'error')
     } finally {
@@ -275,6 +283,7 @@ export default function App() {
       abortRef.current = null
       setBusy(null)
     }
+    return lastOk
   }
   addRef.current = addDocs
 
@@ -465,6 +474,48 @@ export default function App() {
     }
   }, [])
 
+  // Estado do índice de busca: consulta ao abrir, depois acompanha o canal `index`.
+  const refreshIndex = useCallback(() => {
+    api
+      .indexStatus()
+      .then((status) => {
+        setIndexStatus(status)
+        if (!status.busy) setIndexProgress(null)
+      })
+      .catch(() => {})
+  }, [])
+  useEffect(() => {
+    refreshIndex()
+    let dead = false
+    let dispose = null
+    listen('index', (event) => {
+      const p = event.payload
+      if (!p || typeof p.total !== 'number') return
+      // O backend manda { phase: "lexical"|"embeddings"|"idle", done, total, busy }.
+      // Em "lexical" a contagem é de documentos; em "embeddings" é de trechos.
+      const phase = p.phase || 'lexical'
+      if (phase === 'idle' || p.busy === false || p.done >= p.total) {
+        setIndexProgress(null)
+        refreshIndex()
+      } else if (phase === 'lexical') {
+        setIndexProgress({ done: p.done, total: p.total })
+        setIndexStatus((prev) => (prev ? { ...prev, busy: true, docs_total: p.total, docs_indexed: p.done } : prev))
+      } else {
+        setIndexProgress({ done: p.done, total: p.total })
+        setIndexStatus((prev) => (prev ? { ...prev, busy: true } : prev))
+      }
+    })
+      .then((off) => {
+        if (dead) off()
+        else dispose = off
+      })
+      .catch(() => {})
+    return () => {
+      dead = true
+      dispose?.()
+    }
+  }, [refreshIndex])
+
   async function renameDoc(doc, title) {
     try {
       const updated = await api.renameDoc(doc.id, title)
@@ -555,11 +606,25 @@ export default function App() {
   const goToPage = useCallback(
     async (doc, page, annId) => {
       setSource(null)
+      setSearchOpen(false)
       setView('reader')
       if (doc.id !== currentIdRef.current) await selectDoc(doc.id)
       setReaderFocus({ page, annId, nonce: Date.now() })
     },
     [selectDoc],
+  )
+
+  /** Abre o acerto da busca pelo mesmo caminho das citações do assistente. */
+  const openHit = useCallback(
+    (hit) => {
+      const doc = docs.find((d) => d.id === hit.doc_id)
+      if (!doc) {
+        notify('Este documento não está mais na biblioteca.')
+        return
+      }
+      setSource({ doc, page: hit.page, quote: hit.quote || '' })
+    },
+    [docs, notify],
   )
 
   // ---------------------------------------------------------------- atalhos
@@ -571,7 +636,14 @@ export default function App() {
       const key = event.key
       const modalOpen = !!document.querySelector('.overlay')
       if (hasMod(event)) {
-        if (key === 'o' || key === 'O') {
+        if ((key === 'f' || key === 'F') && event.shiftKey) {
+          event.preventDefault()
+          if (!modalOpen) setSearchOpen(true)
+          else {
+            const overlays = document.querySelectorAll('.overlay')
+            overlays[overlays.length - 1]?.querySelector('.search-modal input')?.focus()
+          }
+        } else if (key === 'o' || key === 'O') {
           event.preventDefault()
           if (!modalOpen && !s.busy) s.addDocs()
         } else if (key === ',') {
@@ -628,6 +700,9 @@ export default function App() {
         onClearSelection={() => setSelectedIds([])}
         busy={busy}
         dragging={dragging}
+        onSearch={() => setSearchOpen(true)}
+        indexStatus={indexStatus}
+        indexProgress={indexProgress}
       />
       {(navOpen || chatOpen) && (
         <div
@@ -770,6 +845,14 @@ export default function App() {
             >
               Notas{annotations.length ? <span className="count">{annotations.length}</span> : null}
             </button>
+            <button
+              role="tab"
+              aria-selected={sideTab === 'related'}
+              className={sideTab === 'related' ? 'active' : ''}
+              onClick={() => setSideTab('related')}
+            >
+              Relacionados
+            </button>
           </div>
           <ChatPanel
             docs={docs}
@@ -797,10 +880,35 @@ export default function App() {
             onExport={exportNotes}
             hidden={sideTab !== 'notes'}
           />
+          <RelatedPanel
+            doc={data?.doc}
+            docs={docs}
+            active={sideTab === 'related'}
+            hidden={sideTab !== 'related'}
+            appBusy={!!busy}
+            onImport={(path) => addDocs([path], { select: false })}
+            onOpenDoc={(id) => {
+              setView('reader')
+              selectDoc(id)
+            }}
+            onNotify={notify}
+          />
         </div>
       )}
 
       <Suspense fallback={null}>
+        {searchOpen && (
+          <SearchPanel
+            docs={docs}
+            selectedIds={selectedIds}
+            indexStatus={indexStatus}
+            progress={indexProgress}
+            saved={searchSaved}
+            onSave={setSearchSaved}
+            onOpen={openHit}
+            onClose={() => setSearchOpen(false)}
+          />
+        )}
         {source && (
           <SourceModal
             key={`${source.doc.id}:${source.page}:${source.evidenceId || ''}:${source.quote || ''}`}
@@ -812,6 +920,7 @@ export default function App() {
         {settingsOpen && (
           <SettingsModal
             settings={settings}
+            indexLabel={indexLabel(indexStatus, indexProgress)}
             onClose={() => setSettingsOpen(false)}
             onSaved={setSettings}
             onNotify={notify}

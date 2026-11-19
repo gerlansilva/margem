@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { Icon } from './Icons'
 import { Logo } from './Logo'
 import { isMac, shortcut } from '../lib/platform'
+import { indexLabel } from '../lib/library-search'
 
 const differs = (doc) => !!doc.original_title && doc.original_title !== doc.name
 
@@ -71,6 +72,9 @@ export function Sidebar({
   onClearSelection,
   busy,
   dragging,
+  onSearch,
+  indexStatus,
+  indexProgress,
 }) {
   const [filter, setFilter] = useState('')
   const [editing, setEditing] = useState(null) // { id, value }
@@ -121,6 +125,21 @@ export function Sidebar({
         <Logo />
         <strong>Margem</strong>
       </div>
+
+      <button
+        className="side-search"
+        onClick={onSearch}
+        aria-label="Buscar no acervo"
+        title={`Buscar no acervo (${shortcut('F', { shift: true })})`}
+      >
+        {Icon.search({ className: 'ico' })}
+        <span>Buscar no acervo</span>
+        {indexLabel(indexStatus, indexProgress) ? (
+          <small data-testid="side-index">{indexLabel(indexStatus, indexProgress).replace('Indexando ', '')}</small>
+        ) : (
+          <kbd>{shortcut('F', { shift: true })}</kbd>
+        )}
+      </button>
 
       <button
         className="btn primary block"

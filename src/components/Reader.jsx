@@ -299,7 +299,7 @@ export function Reader({
     if (!doc) return undefined
     const onKey = (event) => {
       const key = event.key.toLowerCase()
-      if (hasMod(event) && key === 'f') {
+      if (hasMod(event) && key === 'f' && !event.shiftKey) {
         event.preventDefault()
         const selected = window.getSelection()?.toString().trim()
         setSearchOpen(true)

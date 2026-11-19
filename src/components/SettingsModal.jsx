@@ -27,36 +27,69 @@ export function keyStatus(settings) {
   }
 }
 
-export function SettingsModal({ settings, onClose, onSaved, onNotify }) {
+export function SettingsModal({ settings, indexLabel = '', onClose, onSaved, onNotify }) {
   const [removing, setRemoving] = useState(false)
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [model, setModel] = useState(settings?.model || 'deepseek-flash')
   const [baseUrl, setBaseUrl] = useState(settings?.base_url || 'https://api.deepseek.com')
+  const [embedUrl, setEmbedUrl] = useState(settings?.embed_base_url || '')
+  const [embedModel, setEmbedModel] = useState(settings?.embed_model || '')
+  const [embedKey, setEmbedKey] = useState('')
+  const [email, setEmail] = useState(settings?.openalex_email || '')
   const [saving, setSaving] = useState(false)
+  const [reindexing, setReindexing] = useState(false)
   const [error, setError] = useState('')
 
-  async function save(event) {
-    event?.preventDefault()
+  /** Valida e grava tudo; devolve as configurações novas ou null se algo falhou. */
+  async function persist() {
     const url = baseUrl.trim()
     if (!/^https?:\/\//i.test(url)) {
       setError('A URL base precisa começar com http:// ou https://')
-      return
+      return null
     }
-    setSaving(true)
+    const eurl = embedUrl.trim()
+    if (eurl && !/^https?:\/\//i.test(eurl)) {
+      setError('A URL dos embeddings precisa começar com http:// ou https://')
+      return null
+    }
     setError('')
+    const next = await api.saveSettings({
+      apiKey: apiKey.trim() || null,
+      model: model.trim() || 'deepseek-flash',
+      baseUrl: url,
+      embedBaseUrl: eurl,
+      embedModel: embedModel.trim(),
+      embedKey: embedKey.trim() || null,
+      openalexEmail: email.trim(),
+    })
+    setApiKey('')
+    setEmbedKey('')
+    onSaved(next)
+    return next
+  }
+
+  async function save(event) {
+    event?.preventDefault()
+    setSaving(true)
     try {
-      const next = await api.saveSettings({
-        apiKey: apiKey.trim() || null,
-        model: model.trim() || 'deepseek-flash',
-        baseUrl: url,
-      })
-      onSaved(next)
-      onClose()
+      if (await persist()) onClose()
     } catch (err) {
       setError(errorText(err))
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function reindex() {
+    setReindexing(true)
+    try {
+      if (!(await persist())) return
+      await api.reindex()
+    } catch (err) {
+      setError(errorText(err))
+    } finally {
+      setReindexing(false)
     }
   }
 
@@ -131,6 +164,62 @@ export function SettingsModal({ settings, onClose, onSaved, onNotify }) {
             URL base
             <input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} spellCheck={false} />
           </label>
+          <fieldset className="form-group">
+            <legend>Busca por significado (opcional)</legend>
+            <label>
+              URL
+              <input
+                value={embedUrl}
+                placeholder="http://localhost:11434/v1"
+                onChange={(event) => setEmbedUrl(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            <label>
+              Modelo
+              <input
+                value={embedModel}
+                placeholder="nomic-embed-text"
+                onChange={(event) => setEmbedModel(event.target.value)}
+                spellCheck={false}
+              />
+            </label>
+            <label>
+              Chave
+              <input
+                type="password"
+                value={embedKey}
+                placeholder={settings?.embed_key_set ? 'Manter a atual' : 'Opcional'}
+                onChange={(event) => setEmbedKey(event.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </label>
+            <span className="form-inline">
+              <button type="button" className="btn tiny" onClick={reindex} disabled={reindexing || saving}>
+                {reindexing ? 'Salvando…' : 'Reindexar'}
+              </button>
+              {indexLabel && (
+                <span className="form-hint" role="status" data-testid="settings-index">
+                  {indexLabel}
+                </span>
+              )}
+            </span>
+          </fieldset>
+          <fieldset className="form-group">
+            <legend>OpenAlex</legend>
+            <label>
+              E-mail
+              <input
+                type="email"
+                value={email}
+                placeholder="voce@universidade.br"
+                onChange={(event) => setEmail(event.target.value)}
+                autoComplete="email"
+                spellCheck={false}
+              />
+            </label>
+          </fieldset>
           {error && (
             <p className="msg-error" role="alert">
               {error}
