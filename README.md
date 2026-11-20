@@ -8,8 +8,8 @@ Leitor de PDF acadêmico com chat que cita página e trecho, e quadro de fichame
 
 Instaladores na página de [Releases](https://github.com/gerlansilva/margem/releases/latest):
 
-- **Windows**: `Margem_0.2.0_x64-setup.exe` (instalador) ou `Margem_0.2.0_x64_pt-BR.msi`.
-- **macOS**: `Margem_0.2.0_universal.dmg` (Apple Silicon e Intel). Não é assinado: na primeira abertura, clique com o botão direito no app e escolha **Abrir**.
+- **Windows**: `Margem_0.3.0_x64-setup.exe` (instalador) ou `Margem_0.3.0_x64_pt-BR.msi`.
+- **macOS**: `Margem_0.3.0_universal.dmg` (Apple Silicon e Intel). Não é assinado: na primeira abertura, clique com o botão direito no app e escolha **Abrir**.
 
 Na primeira execução, abra **Configurações** e cole a chave da DeepSeek.
 
