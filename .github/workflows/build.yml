@@ -103,7 +103,7 @@ jobs:
           args: ${{ matrix.args }}
           tagName: ${{ github.event_name != 'pull_request' && 'v__VERSION__' || '' }}
           releaseName: ${{ github.event_name != 'pull_request' && 'Margem v__VERSION__' || '' }}
-          releaseBody: "Instaladores para Windows (.exe e .msi) e macOS (.dmg, Apple Silicon e Intel). Os builds do Mac não são assinados: na primeira abertura, clique com o botão direito e escolha Abrir."
+          releaseBody: "Instaladores para Windows (.exe e .msi) e macOS (.dmg, Apple Silicon e Intel). O app do Mac tem assinatura ad hoc (gratuita), sem certificado da Apple: na primeira abertura, clique com o botão direito e escolha Abrir (ou Ajustes > Privacidade e Segurança > Abrir mesmo assim)."
           releaseDraft: false
           prerelease: false
       - uses: actions/upload-artifact@v4
